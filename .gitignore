@@ -1,0 +1,53 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Vector store (generated, rebuild with data loader)
+vector_store/faiss_index.bin
+vector_store/metadata.pkl
+
+# Uploads (user-uploaded files, not for source control)
+uploads/
+
+# Test/pytest cache
+.pytest_cache/
+.cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Screenshots / media
+src/screen.png
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp3
+*.wav

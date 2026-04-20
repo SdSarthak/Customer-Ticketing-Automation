@@ -1,0 +1,38 @@
+python-dotenv==1.0.0
+pandas==2.1.4
+numpy==1.26.2
+
+# Google Gemini (embeddings only)
+google-generativeai==0.3.2
+
+# Groq (LLM)
+groq==0.9.0
+
+# Vector Database
+faiss-cpu==1.7.3
+
+# MongoDB
+pymongo==4.6.1
+
+# Multilingual support
+langdetect==1.0.9
+deep-translator==1.11.4
+
+# Voice input
+SpeechRecognition==3.10.0
+audio-recorder-streamlit==0.0.8
+
+# Streamlit UI
+streamlit==1.29.0
+
+# FastAPI backend (for custom frontend)
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.9
+aiofiles==23.2.1
+
+# TTS (edge-tts uses Microsoft neural voices, free, no key needed)
+edge-tts==6.1.12
+
+# Utilities
+tqdm==4.66.1
