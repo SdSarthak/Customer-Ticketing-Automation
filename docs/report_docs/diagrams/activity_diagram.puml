@@ -1,0 +1,302 @@
+@startuml Activity_SelfHelp
+' ============================================
+' ACTIVITY DIAGRAM: Self-Help Resolution Flow
+' ============================================
+
+skinparam activity {
+    BackgroundColor LightYellow
+    BorderColor DarkGreen
+    DiamondBackgroundColor LightBlue
+}
+
+title Self-Help Resolution - Activity Diagram
+
+start
+
+:Customer enters issue description;
+
+:System detects language;
+
+if (Language is English?) then (yes)
+    :Process in English;
+else (no)
+    :Translate to English;
+endif
+
+:Generate embedding vector\n(Gemini API);
+
+:Search FAISS for similar cases\n(top 3 documents);
+
+if (Similar cases found?) then (yes)
+    :Retrieve context documents;
+else (no)
+    :Use generic context;
+endif
+
+:Construct LLM prompt with context;
+
+:Generate troubleshooting steps\n(Groq LLM);
+
+if (Original language != English?) then (yes)
+    :Translate response to\noriginal language;
+else (no)
+    :Keep English response;
+endif
+
+:Display 2-3 actionable steps\nto customer;
+
+if (Issue resolved?) then (yes)
+    :Customer satisfied;
+    stop
+else (no)
+    :Offer ticket creation;
+
+    if (Customer wants ticket?) then (yes)
+        :Redirect to ticket form;
+        stop
+    else (no)
+        :End session;
+        stop
+    endif
+endif
+
+@enduml
+
+
+@startuml Activity_TicketCreation
+' ============================================
+' ACTIVITY DIAGRAM: Ticket Creation Flow
+' ============================================
+
+skinparam activity {
+    BackgroundColor LightGreen
+    BorderColor DarkGreen
+    DiamondBackgroundColor LightBlue
+}
+
+title Ticket Creation - Activity Diagram
+
+|Customer|
+start
+:Fill ticket form\n(name, email, issue);
+
+if (Screenshot provided?) then (yes)
+    :Upload screenshot file;
+else (no)
+endif
+
+:Submit ticket;
+
+|System|
+:Validate input data;
+
+if (Valid?) then (yes)
+else (no)
+    :Return validation error;
+    |Customer|
+    :Correct errors;
+    |System|
+endif
+
+fork
+    :Detect language;
+fork again
+    :Save screenshot\n(if provided);
+end fork
+
+fork
+    :Generate category\n(LLM temp=0.1);
+fork again
+    :Generate priority\n(LLM temp=0.1);
+fork again
+    :Analyze sentiment\n(LLM temp=0.1);
+fork again
+    :Generate summary\n(LLM temp=0.3);
+end fork
+
+:Retrieve similar cases\nfrom FAISS;
+
+:Generate AI response\nwith RAG context;
+
+:Create ticket ID\n(TKT-YYYYMMDD-NNNN);
+
+:Save to MongoDB;
+
+fork
+    :Send customer\nconfirmation email;
+fork again
+    :Send developer\nalert email;
+end fork
+
+|Customer|
+:Receive confirmation\nwith ticket ID;
+
+stop
+
+@enduml
+
+
+@startuml Activity_VoiceChat
+' ============================================
+' ACTIVITY DIAGRAM: Voice Chat Flow
+' ============================================
+
+skinparam activity {
+    BackgroundColor LightCoral
+    BorderColor DarkRed
+    DiamondBackgroundColor LightBlue
+}
+
+title Voice Chat - Activity Diagram
+
+|Customer|
+start
+
+:Click voice chat button;
+
+:Grant microphone permission;
+
+:Record audio message;
+
+:Stop recording;
+
+|Browser|
+:Capture audio blob\n(WAV format);
+
+:Send to server;
+
+|Server|
+:Validate audio file;
+
+if (Valid format & size?) then (yes)
+else (no)
+    :Return error;
+    stop
+endif
+
+:Send to Groq Whisper;
+
+|Whisper API|
+:Transcribe audio;
+:Detect language;
+
+|Server|
+:Receive transcription;
+
+:Process through\nself-help pipeline;
+
+note right
+    - Embedding generation
+    - FAISS search
+    - LLM response
+    - Translation
+end note
+
+:Generate text response;
+
+:Initialize pyttsx3 TTS;
+
+:Configure voice settings\n(rate, volume);
+
+:Synthesize speech;
+
+:Generate WAV audio;
+
+|Browser|
+:Receive audio stream;
+
+:Create Audio element;
+
+|Customer|
+:Listen to spoken response;
+
+if (Need more help?) then (yes)
+    :Record follow-up;
+    |Browser|
+else (no)
+    :End session;
+    stop
+endif
+
+@enduml
+
+
+@startuml Activity_AgentWorkflow
+' ============================================
+' ACTIVITY DIAGRAM: Agent Dashboard Workflow
+' ============================================
+
+skinparam activity {
+    BackgroundColor LightBlue
+    BorderColor DarkBlue
+    DiamondBackgroundColor LightYellow
+}
+
+title Support Agent Workflow - Activity Diagram
+
+|Agent|
+start
+
+:Login to Streamlit dashboard;
+
+:View ticket queue;
+
+if (Apply filters?) then (yes)
+    :Select status filter;
+    :Select priority filter;
+    :Select category filter;
+else (no)
+endif
+
+:Review filtered ticket list;
+
+:Select ticket to process;
+
+|Dashboard|
+:Fetch ticket details;
+:Display AI analysis;
+:Show similar cases;
+:Show sentiment indicator;
+
+|Agent|
+:Review ticket information;
+
+if (Need response samples?) then (yes)
+    |Dashboard|
+    fork
+        :Generate response\n(temp=0.3 Conservative);
+    fork again
+        :Generate response\n(temp=0.7 Balanced);
+    fork again
+        :Generate response\n(temp=1.0 Creative);
+    end fork
+
+    :Display 3 response panels;
+
+    |Agent|
+    :Compare responses;
+    :Select preferred response;
+
+    if (Need to edit?) then (yes)
+        :Modify selected response;
+    else (no)
+    endif
+else (no)
+    :Compose custom response;
+endif
+
+:Send response to customer;
+
+:Update ticket status;
+
+|Dashboard|
+:Save status change to MongoDB;
+
+|Agent|
+if (More tickets to process?) then (yes)
+else (no)
+    :Logout;
+    stop
+endif
+
+@enduml

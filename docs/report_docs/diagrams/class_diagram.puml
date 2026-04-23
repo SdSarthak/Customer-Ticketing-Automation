@@ -1,0 +1,243 @@
+@startuml ClassDiagram
+' ============================================
+' CLASS DIAGRAM
+' Fig. 3.5 - Class Diagram
+' ============================================
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+skinparam class {
+    BackgroundColor White
+    BorderColor Black
+    ArrowColor Black
+}
+
+title AI Customer Support Agent - Class Diagram
+
+' ==========================================
+' CORE DOMAIN CLASSES
+' ==========================================
+
+class Ticket {
+    - ticket_id: String
+    - customer_email: String
+    - customer_name: String
+    - issue_description: String
+    - detected_language: String
+    - category: String
+    - priority: String
+    - sla_hours: Integer
+    - sentiment: String
+    - summary: String
+    - ai_response: String
+    - screenshot_path: String
+    - status: String
+    - similar_cases: List<String>
+    - created_at: DateTime
+    - updated_at: DateTime
+    --
+    + create(): Ticket
+    + update_status(status: String): Boolean
+    + get_by_id(ticket_id: String): Ticket
+    + get_all(): List<Ticket>
+    + enrich_with_ai(): Ticket
+    + add_screenshot(file_path: String): void
+}
+
+class KnowledgeBase {
+    - doc_id: String
+    - title: String
+    - content: String
+    - category: String
+    - tags: List<String>
+    - embedding_id: String
+    - created_at: DateTime
+    --
+    + add_document(doc: Document): String
+    + search_similar(query: String, k: int): List<Document>
+    + rebuild_index(): Boolean
+    + get_by_category(category: String): List<Document>
+}
+
+class Feedback {
+    - feedback_id: String
+    - ticket_id: String
+    - rating: Integer
+    - comments: String
+    - improved_response: String
+    - created_at: DateTime
+    --
+    + submit_feedback(): Boolean
+    + generate_improved_response(): String
+    + get_by_ticket(ticket_id: String): Feedback
+}
+
+' ==========================================
+' AI/ML SERVICE CLASSES
+' ==========================================
+
+class VectorStore <<Service>> {
+    - index: FAISSIndex
+    - documents: List<Document>
+    - embeddings_model: EmbeddingsService
+    - index_path: String
+    - metadata_path: String
+    --
+    + build_index(documents: List): void
+    + search(query_embedding: Vector, k: int): List<Result>
+    + persist(): Boolean
+    + load(): Boolean
+    + add_document(doc: Document): void
+    + get_document_count(): Integer
+}
+
+class LLMClient <<Service>> {
+    - api_key: String
+    - model_name: String
+    - base_url: String
+    --
+    + generate_response(prompt: String, temp: float): String
+    + generate_category(issue: String): String
+    + generate_priority(issue: String): String
+    + generate_sentiment(issue: String): String
+    + generate_summary(issue: String): String
+    + generate_samples(issue: String): List<String>
+}
+
+class EmbeddingsService <<Service>> {
+    - api_key: String
+    - model_name: String
+    - dimensions: Integer = 3072
+    --
+    + generate_embedding(text: String): Vector
+    + batch_embed(texts: List<String>): List<Vector>
+}
+
+class TranslationService <<Service>> {
+    - source_lang: String
+    - target_lang: String
+    --
+    + detect_language(text: String): String
+    + translate(text: String, target: String): String
+    + translate_batch(texts: List, target: String): List
+}
+
+class VoiceService <<Service>> {
+    - whisper_client: GroqClient
+    - tts_engine: pyttsx3.Engine
+    - voice_rate: Integer
+    - voice_volume: Float
+    --
+    + transcribe(audio_file: File): TranscriptionResult
+    + synthesize_speech(text: String): AudioStream
+    + configure_voice(rate: int, volume: float): void
+}
+
+class EmailService <<Service>> {
+    - smtp_server: String
+    - smtp_port: Integer
+    - sender_email: String
+    - sender_password: String
+    --
+    + send_customer_notification(email: String, ticket: Ticket): Boolean
+    + send_developer_alert(ticket: Ticket): Boolean
+    - _build_html_template(ticket: Ticket): String
+}
+
+' ==========================================
+' API/CONTROLLER CLASSES
+' ==========================================
+
+class APIController <<Controller>> {
+    - app: FastAPI
+    - llm_client: LLMClient
+    - vector_store: VectorStore
+    - translation_service: TranslationService
+    --
+    + get_status(): HealthResponse
+    + post_self_help(request: SelfHelpRequest): SelfHelpResponse
+    + post_ticket(request: TicketRequest): TicketResponse
+    + post_ticket_with_screenshot(form: FormData): TicketResponse
+    + get_tickets(): List<Ticket>
+    + get_ticket(ticket_id: String): Ticket
+    + patch_ticket_status(ticket_id: String, status: String): Ticket
+    + post_voice_chat(audio: File): AudioResponse
+    + post_transcribe(audio: File): TranscriptionResponse
+    + post_feedback(request: FeedbackRequest): FeedbackResponse
+    + post_analyze(request: AnalyzeRequest): AnalysisResponse
+}
+
+class DashboardController <<Controller>> {
+    - streamlit_app: StreamlitApp
+    - api_client: HTTPClient
+    --
+    + render_ticket_queue(): void
+    + render_ticket_detail(ticket_id: String): void
+    + render_response_samples(ticket_id: String): void
+    + render_system_health(): void
+    + update_ticket_status(ticket_id: String, status: String): void
+}
+
+' ==========================================
+' DATA CLASSES
+' ==========================================
+
+class SelfHelpRequest <<DataClass>> {
+    + issue: String
+    + language: String = "auto"
+}
+
+class TicketRequest <<DataClass>> {
+    + customer_email: String
+    + customer_name: String
+    + issue_description: String
+    + category: String = None
+    + priority: String = None
+}
+
+class TranscriptionResult <<DataClass>> {
+    + text: String
+    + detected_language: String
+    + confidence: Float
+}
+
+' ==========================================
+' RELATIONSHIPS
+' ==========================================
+
+APIController --> LLMClient : uses
+APIController --> VectorStore : uses
+APIController --> TranslationService : uses
+APIController --> VoiceService : uses
+APIController --> EmailService : uses
+APIController --> Ticket : manages
+APIController --> Feedback : manages
+
+DashboardController --> APIController : calls
+
+VectorStore --> EmbeddingsService : uses
+VectorStore --> KnowledgeBase : indexes
+
+Ticket "1" --> "0..*" Feedback : has
+Ticket --> KnowledgeBase : references similar
+
+LLMClient ..> SelfHelpRequest : processes
+VoiceService ..> TranscriptionResult : returns
+
+note right of VectorStore
+  FAISS IndexFlatIP
+  for inner product search
+  on normalized vectors
+end note
+
+note right of LLMClient
+  Groq Llama 3.3 70B
+  100-200 tokens/sec
+end note
+
+note right of EmbeddingsService
+  Google Gemini
+  3072-dimensional vectors
+end note
+
+@enduml

@@ -1,0 +1,341 @@
+@startuml Sequence_SelfHelp
+' ============================================
+' SEQUENCE DIAGRAM 1: Self-Help Resolution
+' Fig. 3.2 - Sequence Diagram - Self-Help Resolution Process
+' ============================================
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam maxmessagesize 200
+skinparam sequenceParticipant underline
+
+title Self-Help Resolution Process
+
+actor Customer as C
+participant "Customer\nPortal" as Portal #LightBlue
+participant "FastAPI\nServer" as API #LightGreen
+participant "Language\nDetector" as Lang #LightYellow
+participant "Translator" as Trans #LightYellow
+participant "FAISS\nVector Store" as FAISS #Orange
+participant "Gemini\nEmbeddings" as Gemini #Pink
+participant "Groq\nLLM" as LLM #LightCoral
+
+C -> Portal : Enter issue description
+activate Portal
+
+Portal -> API : POST /self-help\n{issue, language}
+activate API
+
+API -> Lang : detect_language(issue)
+activate Lang
+Lang --> API : language_code ("es", "en", etc.)
+deactivate Lang
+
+alt Language != English
+    API -> Trans : translate_to_english(issue)
+    activate Trans
+    Trans --> API : translated_issue
+    deactivate Trans
+end
+
+API -> Gemini : generate_embedding(issue)
+activate Gemini
+Gemini --> API : embedding_vector [3072-dim]
+deactivate Gemini
+
+API -> FAISS : search_similar(embedding, k=3)
+activate FAISS
+FAISS --> API : similar_documents[]
+deactivate FAISS
+
+API -> LLM : generate_response(\nissue, context_docs)
+activate LLM
+note right of LLM
+  Prompt includes:
+  - User issue
+  - Similar historical cases
+  - Instruction for 2-3 steps
+end note
+LLM --> API : troubleshooting_steps
+deactivate LLM
+
+alt Original Language != English
+    API -> Trans : translate_to_original(steps)
+    activate Trans
+    Trans --> API : translated_steps
+    deactivate Trans
+end
+
+API --> Portal : {steps, detected_language}
+deactivate API
+
+Portal --> C : Display troubleshooting steps
+deactivate Portal
+
+note over C, Portal
+  If issue not resolved,
+  customer can escalate
+  to formal ticket
+end note
+
+@enduml
+
+
+@startuml Sequence_TicketCreation
+' ============================================
+' SEQUENCE DIAGRAM 2: Ticket Creation with AI Enrichment
+' Fig. 3.3 - Sequence Diagram - Ticket Creation with AI Enrichment
+' ============================================
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam maxmessagesize 200
+
+title Ticket Creation with AI Enrichment
+
+actor Customer as C
+participant "Customer\nPortal" as Portal #LightBlue
+participant "FastAPI\nServer" as API #LightGreen
+participant "File\nStorage" as Storage #Gray
+participant "Language\nDetector" as Lang #LightYellow
+participant "Groq\nLLM" as LLM #LightCoral
+participant "FAISS" as FAISS #Orange
+participant "MongoDB" as DB #Green
+participant "Email\nService" as Email #Purple
+
+C -> Portal : Fill ticket form\n+ optional screenshot
+activate Portal
+
+Portal -> API : POST /tickets/with-screenshot\n{form_data, file}
+activate API
+
+opt Screenshot Provided
+    API -> Storage : save_file(screenshot)
+    activate Storage
+    Storage --> API : file_path
+    deactivate Storage
+end
+
+API -> Lang : detect_language(issue)
+activate Lang
+Lang --> API : language_code
+deactivate Lang
+
+group Parallel AI Processing
+    API -> LLM : generate_category(issue)
+    activate LLM
+
+    API -> LLM : generate_priority(issue)
+
+    API -> LLM : analyze_sentiment(issue)
+
+    API -> LLM : generate_summary(issue)
+
+    LLM --> API : category
+    LLM --> API : priority + SLA
+    LLM --> API : sentiment
+    LLM --> API : summary
+    deactivate LLM
+end
+
+API -> FAISS : retrieve_similar_cases(issue)
+activate FAISS
+FAISS --> API : similar_tickets[]
+deactivate FAISS
+
+API -> LLM : generate_initial_response(\nissue, context)
+activate LLM
+LLM --> API : ai_response
+deactivate LLM
+
+API -> API : generate_ticket_id()\nTKT-YYYYMMDD-NNNN
+
+API -> DB : save_ticket(enriched_ticket)
+activate DB
+DB --> API : confirmation
+deactivate DB
+
+group Parallel Email Notifications
+    API -> Email : send_customer_confirmation(\nemail, ticket_id)
+    activate Email
+
+    API -> Email : send_developer_alert(\nticket_details, screenshot)
+
+    Email --> API : sent_confirmations
+    deactivate Email
+end
+
+API --> Portal : {ticket_id, status, details}
+deactivate API
+
+Portal --> C : Display confirmation\nwith ticket ID
+deactivate Portal
+
+@enduml
+
+
+@startuml Sequence_VoiceChat
+' ============================================
+' SEQUENCE DIAGRAM 3: Voice Chat Interaction
+' Fig. 3.4 - Sequence Diagram - Voice Chat Interaction
+' ============================================
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam maxmessagesize 200
+
+title Voice Chat Interaction Pipeline
+
+actor Customer as C
+participant "Customer\nPortal" as Portal #LightBlue
+participant "Browser\nMediaRecorder" as Media #LightGray
+participant "FastAPI\nServer" as API #LightGreen
+participant "Groq\nWhisper" as Whisper #Orange
+participant "Language\nDetector" as Lang #LightYellow
+participant "Self-Help\nPipeline" as SelfHelp #LightCoral
+participant "pyttsx3\nTTS" as TTS #Pink
+
+C -> Portal : Click voice chat button
+activate Portal
+
+Portal -> Media : Start recording
+activate Media
+C -> Media : Speak issue description
+Media -> Media : Record audio stream
+C -> Media : Stop recording
+Media --> Portal : audio_blob (WAV)
+deactivate Media
+
+Portal -> API : POST /voice-chat\n{audio_file}
+activate API
+
+API -> API : Validate audio format\n(WAV, MP3, WebM)
+
+API -> Whisper : transcribe(audio_file)
+activate Whisper
+note right of Whisper
+  whisper-large-v3-turbo
+  supports 30+ languages
+end note
+Whisper --> API : {text, detected_language}
+deactivate Whisper
+
+API -> Lang : confirm_language(text)
+activate Lang
+Lang --> API : language_code
+deactivate Lang
+
+API -> SelfHelp : process_issue(text, language)
+activate SelfHelp
+note right of SelfHelp
+  Full RAG pipeline:
+  - Embedding generation
+  - Similar case retrieval
+  - LLM response generation
+  - Translation if needed
+end note
+SelfHelp --> API : response_text
+deactivate SelfHelp
+
+API -> TTS : synthesize_speech(response_text)
+activate TTS
+TTS -> TTS : Configure voice\n(rate, volume)
+TTS -> TTS : Generate WAV audio
+TTS --> API : audio_stream
+deactivate TTS
+
+API --> Portal : audio/wav response\n+ Content-Disposition
+deactivate API
+
+Portal -> Portal : Create Audio element
+Portal -> C : Play audio response
+deactivate Portal
+
+note over C, Portal
+  Customer hears spoken
+  troubleshooting steps
+end note
+
+@enduml
+
+
+@startuml Sequence_ResponseSampling
+' ============================================
+' SEQUENCE DIAGRAM 4: Response Sampling (Agent)
+' Fig. 3.5 - Sequence Diagram - Response Sampling
+' ============================================
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam maxmessagesize 200
+
+title Agent Response Sampling Process
+
+actor "Support\nAgent" as Agent
+participant "Streamlit\nDashboard" as Dashboard #LightBlue
+participant "FastAPI\nServer" as API #LightGreen
+participant "FAISS" as FAISS #Orange
+participant "Groq\nLLM" as LLM #LightCoral
+participant "MongoDB" as DB #Green
+
+Agent -> Dashboard : Select ticket for response
+activate Dashboard
+
+Dashboard -> API : GET /tickets/{ticket_id}
+activate API
+API -> DB : find_ticket(ticket_id)
+activate DB
+DB --> API : ticket_details
+deactivate DB
+API --> Dashboard : ticket_details
+deactivate API
+
+Dashboard --> Agent : Display ticket info,\nAI analysis, similar cases
+
+Agent -> Dashboard : Click "Generate Samples"
+activate Dashboard
+
+Dashboard -> API : POST /sample-responses\n{ticket_id}
+activate API
+
+API -> FAISS : retrieve_context(issue)
+activate FAISS
+FAISS --> API : context_documents
+deactivate FAISS
+
+group Parallel Generation at 3 Temperatures
+    API -> LLM : generate(temp=0.3)\n"Conservative"
+    activate LLM
+
+    API -> LLM : generate(temp=0.7)\n"Balanced"
+
+    API -> LLM : generate(temp=1.0)\n"Creative"
+
+    LLM --> API : response_conservative
+    LLM --> API : response_balanced
+    LLM --> API : response_creative
+    deactivate LLM
+end
+
+API --> Dashboard : {samples: [\n  {temp: 0.3, text: ...},\n  {temp: 0.7, text: ...},\n  {temp: 1.0, text: ...}\n]}
+deactivate API
+
+Dashboard --> Agent : Display 3 response panels\nside-by-side
+deactivate Dashboard
+
+Agent -> Dashboard : Select preferred response
+Agent -> Dashboard : Optionally edit response
+Agent -> Dashboard : Click "Send Response"
+
+Dashboard -> API : PATCH /tickets/{id}\n{response, status}
+activate API
+API -> DB : update_ticket()
+activate DB
+DB --> API : updated
+deactivate DB
+API --> Dashboard : confirmation
+deactivate API
+
+Dashboard --> Agent : "Response sent successfully"
+
+@enduml

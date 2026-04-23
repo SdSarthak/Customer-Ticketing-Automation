@@ -1,0 +1,207 @@
+@startuml UseCase_CustomerSelfHelp
+' ============================================
+' USE CASE DIAGRAM 1: Customer Self-Help
+' Fig. 2.1 - Use Case Diagram - Customer Self-Help
+' ============================================
+
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecase {
+    BackgroundColor LightYellow
+    BorderColor DarkGreen
+    ArrowColor DarkGreen
+}
+
+title AI Customer Support Agent - Use Case Diagram\nCustomer Self-Help & Ticket Operations
+
+left to right direction
+
+actor "Customer" as customer
+actor "Groq LLM" as groq <<External System>>
+actor "Gemini API" as gemini <<External System>>
+actor "Email Service" as email <<External System>>
+
+rectangle "AI Customer Support Agent System" {
+    usecase "Get Self-Help\nResolution" as UC1
+    usecase "Submit Support\nTicket" as UC2
+    usecase "Upload Screenshot" as UC3
+    usecase "Track Ticket\nStatus" as UC4
+    usecase "Provide Feedback" as UC5
+    usecase "Detect Language" as UC6
+    usecase "Translate Query" as UC7
+    usecase "Generate AI\nResponse" as UC8
+    usecase "Retrieve Similar\nCases (RAG)" as UC9
+    usecase "Categorize Ticket" as UC10
+    usecase "Assign Priority" as UC11
+    usecase "Analyze Sentiment" as UC12
+    usecase "Send Email\nNotification" as UC13
+}
+
+' Customer interactions
+customer --> UC1
+customer --> UC2
+customer --> UC4
+customer --> UC5
+UC2 ..> UC3 : <<extend>>
+
+' Include relationships
+UC1 ..> UC6 : <<include>>
+UC1 ..> UC9 : <<include>>
+UC1 ..> UC8 : <<include>>
+UC6 ..> UC7 : <<extend>>
+
+UC2 ..> UC10 : <<include>>
+UC2 ..> UC11 : <<include>>
+UC2 ..> UC12 : <<include>>
+UC2 ..> UC13 : <<include>>
+
+' External system connections
+UC8 --> groq
+UC9 --> gemini
+UC13 --> email
+
+note right of UC1
+  Self-help attempts to resolve
+  issue before creating ticket
+end note
+
+note right of UC2
+  Tickets are automatically
+  enriched with AI metadata
+end note
+
+@enduml
+
+
+@startuml UseCase_VoiceSupport
+' ============================================
+' USE CASE DIAGRAM 2: Voice Support
+' Fig. 2.2 - Use Case Diagram - Voice Support
+' ============================================
+
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecase {
+    BackgroundColor LightBlue
+    BorderColor DarkBlue
+    ArrowColor DarkBlue
+}
+
+title AI Customer Support Agent - Use Case Diagram\nVoice Support & Multilingual Operations
+
+left to right direction
+
+actor "Customer" as customer
+actor "Groq Whisper" as whisper <<External System>>
+actor "TTS Engine" as tts <<External System>>
+
+rectangle "Voice & Multilingual Module" {
+    usecase "Use Voice Chat" as UC1
+    usecase "Record Audio\nMessage" as UC2
+    usecase "Transcribe\nSpeech" as UC3
+    usecase "Detect Language" as UC4
+    usecase "Process Issue" as UC5
+    usecase "Generate\nResponse" as UC6
+    usecase "Synthesize\nSpeech" as UC7
+    usecase "Play Audio\nResponse" as UC8
+    usecase "Translate to\nEnglish" as UC9
+    usecase "Translate to\nUser Language" as UC10
+}
+
+customer --> UC1
+UC1 ..> UC2 : <<include>>
+UC2 ..> UC3 : <<include>>
+UC3 --> whisper
+
+UC3 ..> UC4 : <<include>>
+UC4 ..> UC9 : <<extend>>
+
+UC1 ..> UC5 : <<include>>
+UC5 ..> UC6 : <<include>>
+UC6 ..> UC10 : <<extend>>
+
+UC1 ..> UC7 : <<include>>
+UC7 --> tts
+UC7 ..> UC8 : <<include>>
+UC8 --> customer
+
+note right of UC3
+  Whisper supports
+  30+ languages
+end note
+
+note right of UC7
+  pyttsx3 provides
+  offline TTS
+end note
+
+@enduml
+
+
+@startuml UseCase_AdminOperations
+' ============================================
+' USE CASE DIAGRAM 3: Admin/Agent Operations
+' Fig. 2.3 - Use Case Diagram - Admin Operations
+' ============================================
+
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+skinparam usecase {
+    BackgroundColor LightGreen
+    BorderColor DarkGreen
+    ArrowColor DarkGreen
+}
+
+title AI Customer Support Agent - Use Case Diagram\nAdmin Dashboard & Agent Operations
+
+left to right direction
+
+actor "Support Agent" as agent
+actor "Admin" as admin
+actor "MongoDB" as mongo <<External System>>
+actor "Groq LLM" as groq <<External System>>
+
+rectangle "Admin Dashboard Module" {
+    usecase "Login to\nDashboard" as UC1
+    usecase "View Ticket\nQueue" as UC2
+    usecase "Filter Tickets" as UC3
+    usecase "Review Ticket\nDetails" as UC4
+    usecase "View AI Analysis" as UC5
+    usecase "View Similar\nCases" as UC6
+    usecase "Generate Response\nSamples" as UC7
+    usecase "Update Ticket\nStatus" as UC8
+    usecase "View System\nHealth" as UC9
+    usecase "Rebuild Knowledge\nBase" as UC10
+    usecase "Monitor API\nUsage" as UC11
+}
+
+agent --> UC1
+agent --> UC2
+agent --> UC4
+agent --> UC7
+agent --> UC8
+
+admin --> UC1
+admin --> UC9
+admin --> UC10
+admin --> UC11
+
+UC2 ..> UC3 : <<extend>>
+UC4 ..> UC5 : <<include>>
+UC4 ..> UC6 : <<include>>
+
+UC7 --> groq
+UC2 --> mongo
+UC8 --> mongo
+
+note right of UC7
+  Generates 3 responses at
+  temperatures 0.3, 0.7, 1.0
+end note
+
+note right of UC10
+  Rebuilds FAISS vector
+  index from CSV data
+end note
+
+@enduml

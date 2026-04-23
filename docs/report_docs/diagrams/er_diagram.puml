@@ -1,0 +1,281 @@
+@startuml ERDiagram
+' ============================================
+' ENTITY RELATIONSHIP DIAGRAM
+' Fig. 3.8 - Entity-Relationship Diagram
+' ============================================
+
+skinparam linetype ortho
+skinparam class {
+    BackgroundColor White
+    BorderColor Black
+}
+
+title AI Customer Support Agent - Entity Relationship Diagram
+
+' ==========================================
+' ENTITIES
+' ==========================================
+
+entity "Ticket" as ticket {
+    * ticket_id : STRING <<PK>>
+    --
+    * customer_email : STRING
+    * customer_name : STRING
+    * issue_description : TEXT
+    * detected_language : STRING
+    * category : STRING <<FK>>
+    * priority : STRING <<FK>>
+    * sla_hours : INTEGER
+    * sentiment : STRING
+    * summary : TEXT
+    * ai_response : TEXT
+    screenshot_path : STRING
+    * status : STRING
+    similar_cases : ARRAY
+    * created_at : DATETIME
+    * updated_at : DATETIME
+}
+
+entity "Category" as category {
+    * category_id : STRING <<PK>>
+    --
+    * name : STRING
+    * description : TEXT
+    * default_sla : INTEGER
+    * keywords : ARRAY
+}
+
+entity "Priority" as priority {
+    * priority_id : STRING <<PK>>
+    --
+    * name : STRING
+    * level : INTEGER
+    * sla_hours : INTEGER
+    * color_code : STRING
+}
+
+entity "KnowledgeBase" as kb {
+    * doc_id : STRING <<PK>>
+    --
+    * title : STRING
+    * content : TEXT
+    * category : STRING
+    * tags : ARRAY
+    * embedding_id : STRING
+    * created_at : DATETIME
+    * updated_at : DATETIME
+}
+
+entity "Embedding" as embedding {
+    * embedding_id : STRING <<PK>>
+    --
+    * doc_id : STRING <<FK>>
+    * vector : ARRAY[3072]
+    * model_version : STRING
+    * created_at : DATETIME
+}
+
+entity "Feedback" as feedback {
+    * feedback_id : STRING <<PK>>
+    --
+    * ticket_id : STRING <<FK>>
+    * rating : INTEGER
+    comments : TEXT
+    improved_response : TEXT
+    * created_at : DATETIME
+}
+
+entity "Screenshot" as screenshot {
+    * file_id : STRING <<PK>>
+    --
+    * ticket_id : STRING <<FK>>
+    * file_path : STRING
+    * file_name : STRING
+    * file_size : INTEGER
+    * mime_type : STRING
+    * uploaded_at : DATETIME
+}
+
+entity "SimilarCase" as similar {
+    * relation_id : STRING <<PK>>
+    --
+    * source_ticket_id : STRING <<FK>>
+    * similar_ticket_id : STRING <<FK>>
+    * similarity_score : FLOAT
+    * created_at : DATETIME
+}
+
+entity "SystemLog" as log {
+    * log_id : STRING <<PK>>
+    --
+    * timestamp : DATETIME
+    * level : STRING
+    * service : STRING
+    * message : TEXT
+    * request_id : STRING
+    response_time_ms : INTEGER
+}
+
+entity "APIUsage" as usage {
+    * usage_id : STRING <<PK>>
+    --
+    * api_name : STRING
+    * endpoint : STRING
+    * request_count : INTEGER
+    * token_count : INTEGER
+    * date : DATE
+}
+
+' ==========================================
+' RELATIONSHIPS
+' ==========================================
+
+ticket ||--o{ feedback : "receives"
+ticket ||--o| screenshot : "has"
+ticket }o--|| category : "belongs to"
+ticket }o--|| priority : "has"
+ticket ||--o{ similar : "source"
+ticket ||--o{ similar : "target"
+
+kb ||--|| embedding : "has"
+kb }o--|| category : "belongs to"
+
+' ==========================================
+' CARDINALITY NOTES
+' ==========================================
+
+note right of ticket
+    Sequential ID Format:
+    TKT-YYYYMMDD-NNNN
+
+    Status values:
+    - open
+    - in_progress
+    - resolved
+end note
+
+note right of category
+    7 Standard Categories:
+    - Billing
+    - Technical Support
+    - Account Management
+    - Product Information
+    - Shipping & Delivery
+    - Returns & Refunds
+    - General Inquiry
+end note
+
+note right of priority
+    4 Priority Levels:
+    - Urgent (2 hrs)
+    - High (8 hrs)
+    - Medium (24 hrs)
+    - Low (72 hrs)
+end note
+
+note right of embedding
+    Google Gemini
+    3072-dimensional vectors
+    Stored in FAISS index
+end note
+
+note right of feedback
+    Rating: 1-5 scale
+    Triggers improved
+    response generation
+end note
+
+@enduml
+
+
+' ==========================================
+' ALTERNATIVE: CROW'S FOOT NOTATION
+' ==========================================
+
+@startuml ERDiagram_CrowFoot
+
+skinparam linetype ortho
+
+title AI Customer Support Agent - ER Diagram (Crow's Foot Notation)
+
+entity "TICKET" as T {
+    + ticket_id [PK]
+    --
+    customer_email
+    customer_name
+    issue_description
+    detected_language
+    category_id [FK]
+    priority_id [FK]
+    sla_hours
+    sentiment
+    summary
+    ai_response
+    screenshot_path
+    status
+    created_at
+    updated_at
+}
+
+entity "CATEGORY" as C {
+    + category_id [PK]
+    --
+    name
+    description
+    default_sla
+}
+
+entity "PRIORITY" as P {
+    + priority_id [PK]
+    --
+    name
+    level
+    sla_hours
+}
+
+entity "FEEDBACK" as F {
+    + feedback_id [PK]
+    --
+    ticket_id [FK]
+    rating
+    comments
+    improved_response
+    created_at
+}
+
+entity "KNOWLEDGE_BASE" as KB {
+    + doc_id [PK]
+    --
+    title
+    content
+    category
+    tags
+    embedding_id
+    created_at
+}
+
+entity "EMBEDDING" as E {
+    + embedding_id [PK]
+    --
+    doc_id [FK]
+    vector
+    model_version
+}
+
+entity "SIMILAR_CASES" as S {
+    + relation_id [PK]
+    --
+    source_ticket_id [FK]
+    similar_ticket_id [FK]
+    similarity_score
+}
+
+' Relationships with Crow's Foot notation
+C ||--o{ T : "classifies"
+P ||--o{ T : "prioritizes"
+T ||--o{ F : "receives"
+T ||--o{ S : "is source"
+T ||--o{ S : "is similar to"
+KB ||--|| E : "has"
+
+@enduml
