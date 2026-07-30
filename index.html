@@ -143,6 +143,16 @@ nav{
 }
 .field textarea{resize:vertical;min-height:70px;line-height:1.6}
 
+/* ═══ FEEDBACK RATING ═══ */
+.fb-stars{display:flex;gap:4px}
+.fb-star{
+  background:none;border:none;cursor:pointer;padding:0 2px;
+  font-size:22px;line-height:1;color:var(--border2);
+  transition:color .15s,transform .15s}
+.fb-star:hover{transform:scale(1.15)}
+.fb-star.on{color:var(--warn)}
+.fb-star:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+
 /* ═══ CHAT ═══ */
 #tab-chat{display:none;grid-template-rows:auto 1fr auto;height:100%}
 #tab-chat.active{display:grid}
@@ -639,8 +649,12 @@ td select{
 <div id="toast"></div>
 
 <script>
-const API = 'http://localhost:8000';
-let chatState='idle', attempts=0, lastQ='', isRec=false, mRec=null, aChunks=[];
+// Same-origin by default: api.py serves this page, so the page works on any
+// host/port without editing. Override with ?api=http://host:port when the
+// frontend is served separately from the backend.
+const API = new URLSearchParams(location.search).get('api')
+  || (location.protocol.startsWith('http') ? location.origin : 'http://localhost:8000');
+let chatState='idle', attempts=0, lastQ='', lastAnswer='', isRec=false, mRec=null, aChunks=[];
 let adminOk=false, allTkts=[], tblFilter='all';
 
 // STATUS
@@ -719,8 +733,15 @@ async function send(){
   try{
     const r=await fetch(`${API}/self-help`,{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({issue:txt})});
+    if(!r.ok){
+      const err=await r.json().catch(()=>({}));
+      addMsg('bot',`⚠ ${esc(err.detail||'The assistant is unavailable right now.')}`);
+      setSt('idle','Service unavailable');
+      return;
+    }
     const d=await r.json();
     const steps=d.steps||[];
+    lastAnswer=[d.response||'', ...steps].filter(Boolean).join('\n');
     const sh=steps.length
       ?`<div class="step-list">${steps.map((s,i)=>`<div class="step-item"><span class="step-n">${i+1}</span><span>${esc(s)}</span></div>`).join('')}</div>`:
       '';
@@ -732,7 +753,7 @@ async function send(){
       </div>`,true);
     setSt('selfhelp','Did that help?');
   }catch{
-    addMsg('bot','⚠ Cannot reach the API. Make sure uvicorn is running on port 8000.');
+    addMsg('bot','⚠ Cannot reach the API. Make sure the backend is running.');
     setSt('idle','Connection error');
   }
 }
@@ -741,7 +762,83 @@ function resolved(){rmActs();addMsg('bot','🎉 Glad that worked! Feel free to r
 function failed(){
   rmActs(); attempts++; updPips();
   if(attempts>=2){addMsg('bot',"I couldn't solve this automatically. Let me open a ticket for our team.");showForm();}
+  else if(lastAnswer){showFeedback();}
   else{addMsg('bot',"Sorry that didn't work! Try adding more detail about what you're seeing.");setSt('selfhelp',`Attempt ${attempts}/2 — try again`)}
+}
+
+// FEEDBACK LOOP — rate the answer and have the model rewrite it
+function showFeedback(){
+  document.getElementById('fb-row')?.remove();
+  setSt('selfhelp','Tell us what was missing');
+  const msgs=document.getElementById('messages');
+  const row=document.createElement('div'); row.className='msg bot'; row.id='fb-row';
+  const stars=[1,2,3,4,5].map(n=>
+    `<button type="button" class="fb-star" data-n="${n}" onclick="setRating(${n})" aria-label="${n} star">★</button>`
+  ).join('');
+  row.innerHTML=`<div class="msg-av">AI</div>
+    <div class="tform-card">
+      <h3>Help me improve that answer</h3>
+      <div class="field">
+        <label>How useful was it?</label>
+        <div class="fb-stars" id="fb-stars">${stars}</div>
+      </div>
+      <div class="field">
+        <label>What was wrong or missing?</label>
+        <textarea id="fb-text" rows="3" placeholder="e.g. the steps assumed I use the mobile app, but I'm on the website"></textarea>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-success" onclick="submitFeedback()">↻ &nbsp;Improve the answer</button>
+        <button class="btn btn-warn" onclick="skipFeedback()">Skip — retry myself</button>
+      </div>
+    </div>`;
+  msgs.appendChild(row); msgs.scrollTop=msgs.scrollHeight;
+  setRating(3);
+}
+
+let fbRating=3;
+function setRating(n){
+  fbRating=n;
+  document.querySelectorAll('#fb-stars .fb-star').forEach(b=>{
+    b.classList.toggle('on', Number(b.dataset.n)<=n);
+  });
+}
+
+function skipFeedback(){
+  document.getElementById('fb-row')?.remove();
+  addMsg('bot',"No problem — try adding more detail about what you're seeing.");
+  setSt('selfhelp',`Attempt ${attempts}/2 — try again`);
+}
+
+async function submitFeedback(){
+  const text=document.getElementById('fb-text').value.trim();
+  if(!text){toast('Tell us briefly what was wrong','warn');return}
+  document.getElementById('fb-row')?.remove();
+  showTyping();
+  try{
+    const r=await fetch(`${API}/feedback`,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({query:lastQ,original_response:lastAnswer,feedback:text,rating:fbRating})});
+    document.getElementById('typing-row')?.remove();
+    if(!r.ok){
+      const err=await r.json().catch(()=>({}));
+      addMsg('bot',`⚠ ${esc(err.detail||'Could not improve the answer right now.')}`);
+      setSt('selfhelp','Try again');
+      return;
+    }
+    const d=await r.json();
+    lastAnswer=d.improved_response||lastAnswer;
+    addMsg('bot',`<p><strong>Thanks — here's an updated answer:</strong></p>
+      <p>${esc(d.improved_response||'').replace(/\n/g,'<br>')}</p>
+      <div class="action-row">
+        <button class="btn btn-success" onclick="resolved()">✓ &nbsp;This solved it</button>
+        <button class="btn btn-danger"  onclick="failed()">✗ &nbsp;Still not working</button>
+        <button class="btn btn-warn"    onclick="showForm()">⚡ Create Ticket</button>
+      </div>`,true);
+    setSt('selfhelp','Did that help?');
+  }catch{
+    document.getElementById('typing-row')?.remove();
+    addMsg('bot','⚠ Cannot reach the API. Make sure the backend is running.');
+    setSt('idle','Connection error');
+  }
 }
 
 function showForm(){
@@ -908,6 +1005,7 @@ async function vcSendAudio(blob){
     const replyText=(res.headers.get('X-Response-Text')||'').trim();
 
     if(transcript){ vcAddMsg('user',transcript); addMsg('user',transcript); lastQ=transcript; }
+    if(replyText){ lastAnswer=replyText; }
     vcAttempt++;
 
     const lines=replyText.split('\n').map(l=>l.trim()).filter(Boolean);
