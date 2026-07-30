@@ -8,19 +8,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def env(name: str, default: str = "") -> str:
+    """
+    Read an environment variable, treating a blank value as unset.
+
+    os.getenv("X", default) returns "" when the .env file contains a bare
+    `X=` line, which then reaches the client libraries as a real (invalid)
+    value — an empty MONGODB_URI fails with "Empty host (or extra comma in
+    host list)" rather than falling back to localhost.
+    """
+    value = os.getenv(name)
+    return default if value is None or not value.strip() else value.strip()
+
+
 class Config:
     # Google Gemini (embeddings)
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+    GOOGLE_API_KEY = env("GOOGLE_API_KEY")
 
     # Groq (LLM)
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    GROQ_API_KEY = env("GROQ_API_KEY")
 
     # Model names
     EMBEDDING_MODEL = "models/gemini-embedding-001"
     LLM_MODEL = "llama-3.3-70b-versatile"
 
     # Vector Store
-    VECTOR_STORE_PATH = "vector_store"
+    VECTOR_STORE_PATH = env("VECTOR_STORE_PATH", "vector_store")
     CHUNK_SIZE = 500
     CHUNK_OVERLAP = 50
 
@@ -34,16 +47,16 @@ class Config:
     NUM_RESPONSE_CANDIDATES = 3
 
     # MongoDB
-    MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-    MONGODB_DB = os.getenv("MONGODB_DB", "customer_support")
+    MONGODB_URI = env("MONGODB_URI", "mongodb://localhost:27017")
+    MONGODB_DB = env("MONGODB_DB", "customer_support")
 
     # Gmail SMTP
-    GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "")
-    GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-    DEVELOPER_EMAIL = os.getenv("DEVELOPER_EMAIL", "")
+    GMAIL_ADDRESS = env("GMAIL_ADDRESS")
+    GMAIL_APP_PASSWORD = env("GMAIL_APP_PASSWORD")
+    DEVELOPER_EMAIL = env("DEVELOPER_EMAIL")
 
     # Data
-    DATA_PATH = "data/customer_support_tickets.csv"
+    DATA_PATH = env("DATA_PATH", "data/customer_support_tickets.csv")
 
     # Ticket categories
     TICKET_CATEGORIES = [
