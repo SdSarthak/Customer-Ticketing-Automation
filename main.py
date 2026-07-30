@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.config import Config
 from src.data_loader import DataLoader
-from src.embeddings import GeminiEmbeddings
+from src.embeddings import GeminiEmbeddings, EmbeddingError
 from src.vector_store import FAISSVectorStore
 from src.rag_engine import RAGEngine
 from src.response_generator import ResponseGenerator
@@ -77,16 +77,23 @@ def initialize_system(data_path: str = None, force_rebuild: bool = False):
     print(f"  Columns: {stats['columns']}")
     
     documents = loader.create_documents()
-    
-    # Initialize RAG engine
+
+    # Initialize RAG engine. Embedding the corpus is the one step that costs
+    # real API calls, so surface its failures as a readable message instead of
+    # a traceback — and never persist an index that did not build cleanly.
     print("\n🔄 Initializing RAG Engine...")
     rag_engine = RAGEngine()
-    rag_engine.initialize_from_documents(documents)
-    
+    try:
+        rag_engine.initialize_from_documents(documents)
+    except (EmbeddingError, ValueError) as e:
+        print(f"\n❌ Could not build the vector store: {e}")
+        print("Nothing was saved — fix the problem above and re-run --setup.")
+        return None
+
     # Save vector store
     print(f"\n💾 Saving vector store to: {vector_store_path}")
     rag_engine.save_to_disk(vector_store_path)
-    
+
     return rag_engine
 
 

@@ -609,6 +609,27 @@ class TestRAGEngine:
         assert analysis["num_results"] == 3
         assert analysis["max_similarity"] == pytest.approx(0.9)
 
+    def test_empty_index_is_not_reported_as_initialized(self):
+        from src.rag_engine import RAGEngine
+        embedder, vector_store = MagicMock(), MagicMock()
+        embedder.embed_documents.return_value = [{"combined_text": "x"}]
+        vector_store.get_stats.return_value = {"total_documents": 0}
+        engine = RAGEngine(embedder=embedder, vector_store=vector_store)
+
+        with pytest.raises(ValueError, match="usable embedding"):
+            engine.initialize_from_documents([{"combined_text": "x"}])
+        assert engine.is_initialized is False
+
+    def test_successful_build_marks_engine_initialized(self):
+        from src.rag_engine import RAGEngine
+        embedder, vector_store = MagicMock(), MagicMock()
+        embedder.embed_documents.return_value = [{"combined_text": "x"}]
+        vector_store.get_stats.return_value = {"total_documents": 1}
+        engine = RAGEngine(embedder=embedder, vector_store=vector_store)
+
+        engine.initialize_from_documents([{"combined_text": "x"}])
+        assert engine.is_initialized is True
+
 
 # ── EMAIL SERVICE ─────────────────────────────────────────────────────────────
 

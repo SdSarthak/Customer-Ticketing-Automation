@@ -32,6 +32,17 @@ class RAGEngine:
         docs_with_embeddings = self.embedder.embed_documents(documents, text_field)
         self.vector_store.create_index()
         self.vector_store.add_documents(docs_with_embeddings)
+
+        # add_documents drops entries whose embedding is a zero vector. If that
+        # leaves nothing, the engine would answer every query with "no similar
+        # tickets" forever — treat it as a failed build rather than a ready one.
+        if self.vector_store.get_stats()["total_documents"] == 0:
+            raise ValueError(
+                f"None of the {len(documents)} documents produced a usable "
+                "embedding, so the index is empty. Check GOOGLE_API_KEY and that "
+                "the source data has non-empty text."
+            )
+
         self.is_initialized = True
         print("RAG Engine initialized successfully")
 
