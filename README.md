@@ -121,7 +121,8 @@ User Request (Text / Voice)
     ├── features.md             # Feature documentation
     ├── architecture.md         # System architecture
     ├── use-cases.md            # Use case diagrams & scenarios
-    └── tech-stack.md           # Technology decisions & trade-offs
+    ├── tech-stack.md           # Technology decisions & trade-offs
+    └── report_docs/            # Academic report + UML/DFD diagrams
 ```
 
 ---
@@ -191,6 +192,7 @@ docs are served at `/docs` while the server is running.
 - [Architecture](docs/architecture.md) — System design and component interactions
 - [Use Cases](docs/use-cases.md) — User scenarios and flow diagrams
 - [Tech Stack](docs/tech-stack.md) — Technology choices and rationale
+- [Project Report](docs/report_docs/) — Academic write-up with UML, DFD and ER diagrams
 
 ---
 
@@ -224,6 +226,8 @@ pytest --cov=src --cov-report=html
 | `Empty host (or extra comma in host list)` | `MONGODB_URI=` is blank in `.env`. Remove the line or give it a real URI |
 | `/status` shows `Degraded — RAG not ready` | No FAISS index yet. Run `python main.py --setup` |
 | `401 Invalid API Key` in a response | `GROQ_API_KEY` or `GOOGLE_API_KEY` is expired — regenerate it |
+| `--setup` aborts with `consecutive embedding calls failed` | `GOOGLE_API_KEY` is invalid or out of quota. Setup stops early and saves nothing rather than persisting an index of empty vectors that would match nothing — fix the key and re-run |
+| Answers never cite similar tickets | The index built while embeddings were failing. Rebuild with `python main.py --setup --force-rebuild` |
 
 ---
 
