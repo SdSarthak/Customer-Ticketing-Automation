@@ -9,6 +9,7 @@ Groq, Gemini and MongoDB are all mocked.
 import datetime
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -747,6 +748,52 @@ class TestTranslator:
     def test_detects_english_sentence(self):
         from src.translator import detect_language
         assert detect_language("I cannot log into my account today") == "en"
+
+    def test_short_latin_phrase_falls_back_to_english(self):
+        # Too little signal to trust — langdetect calls this Italian
+        from src.translator import detect_language
+        assert detect_language("cannot log in") == "en"
+
+    def test_detects_non_latin_script_despite_short_length(self):
+        from src.translator import detect_language
+        assert detect_language("मेरा ऑर्डर कहाँ है") == "hi"
+
+    def test_detects_long_latin_sentence(self):
+        from src.translator import detect_language
+        assert detect_language("Je ne peux pas me connecter a mon compte aujourd hui") == "fr"
+
+    def test_detection_is_deterministic(self):
+        from src.translator import detect_language
+        text = "मेरा ऑर्डर अभी तक नहीं आया है"
+        assert len({detect_language(text) for _ in range(5)}) == 1
+
+    def test_low_confidence_falls_back_to_english(self):
+        import src.translator as translator
+        guess = SimpleNamespace(lang="fr", prob=0.42)
+        with patch.object(translator, "detect_langs", return_value=[guess]):
+            assert translator.detect_language("a fairly long ambiguous sentence") == "en"
+
+    def test_unsupported_language_falls_back_to_english(self):
+        import src.translator as translator
+        guess = SimpleNamespace(lang="cy", prob=0.99)
+        with patch.object(translator, "detect_langs", return_value=[guess]):
+            assert translator.detect_language("a fairly long ambiguous sentence") == "en"
+
+    def test_supported_language_is_reported(self):
+        import src.translator as translator
+        guess = SimpleNamespace(lang="de", prob=0.99)
+        with patch.object(translator, "detect_langs", return_value=[guess]):
+            assert translator.detect_language("a fairly long ambiguous sentence") == "de"
+
+    def test_empty_candidate_list_falls_back_to_english(self):
+        import src.translator as translator
+        with patch.object(translator, "detect_langs", return_value=[]):
+            assert translator.detect_language("a fairly long ambiguous sentence") == "en"
+
+    def test_detector_error_falls_back_to_english(self):
+        import src.translator as translator
+        with patch.object(translator, "detect_langs", side_effect=RuntimeError("boom")):
+            assert translator.detect_language("a fairly long ambiguous sentence") == "en"
 
     def test_english_target_is_a_passthrough(self):
         from src.translator import translate_from_english

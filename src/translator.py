@@ -6,7 +6,12 @@ Language detection and translation using deep-translator (no API key needed)
 from typing import Optional
 
 try:
-    from langdetect import detect, LangDetectException
+    from langdetect import detect_langs, DetectorFactory, LangDetectException
+
+    # langdetect seeds its sampling from the clock by default, so the same
+    # sentence can be reported as different languages on consecutive calls.
+    # A fixed seed makes detection reproducible.
+    DetectorFactory.seed = 0
     LANGDETECT_AVAILABLE = True
 except ImportError:
     LANGDETECT_AVAILABLE = False
@@ -47,6 +52,20 @@ LANGUAGE_NAMES = {
 }
 
 
+# A short run of Latin letters carries very little signal — langdetect happily
+# calls "cannot log in" Italian, which would then translate an English reply
+# into Italian. Demand a longer, confidently-detected string before believing
+# anything other than English. Non-Latin scripts are exempt: they are
+# unambiguous even in a handful of characters.
+MIN_LATIN_CHARS = 20
+MIN_CONFIDENCE = 0.90
+
+
+def _has_non_latin(text: str) -> bool:
+    """True if the text uses a script other than basic Latin (Devanagari, CJK…)."""
+    return any(ord(ch) > 0x024F for ch in text)
+
+
 def detect_language(text: str) -> str:
     """
     Detect the language of the given text.
@@ -55,17 +74,40 @@ def detect_language(text: str) -> str:
         text: Input text
 
     Returns:
-        ISO 639-1 language code (e.g. 'en', 'hi', 'fr').
-        Returns 'en' if detection fails or library not available.
+        ISO 639-1 language code (e.g. 'en', 'hi', 'fr'). Falls back to 'en'
+        when detection is unavailable, unconfident, or returns a language the
+        rest of the pipeline cannot translate to.
     """
-    if not LANGDETECT_AVAILABLE or not text or len(text.strip()) < 5:
+    if not LANGDETECT_AVAILABLE or not text:
         return "en"
+
+    stripped = text.strip()
+    if len(stripped) < 5:
+        return "en"
+
+    # Pure-Latin text needs enough characters to be worth trusting
+    if not _has_non_latin(stripped) and len(stripped) < MIN_LATIN_CHARS:
+        return "en"
+
     try:
-        return detect(text)
+        candidates = detect_langs(stripped)
     except LangDetectException:
         return "en"
     except Exception:
         return "en"
+
+    if not candidates:
+        return "en"
+
+    best = candidates[0]
+    if best.prob < MIN_CONFIDENCE:
+        return "en"
+
+    # Only report languages the translator and voice layers actually support
+    if best.lang not in LANGUAGE_NAMES:
+        return "en"
+
+    return best.lang
 
 
 def translate_to_english(text: str, src_lang: Optional[str] = None) -> str:
