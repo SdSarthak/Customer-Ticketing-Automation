@@ -3,6 +3,7 @@ Response Generator Module
 Generates customer support responses using Groq LLM with RAG context
 """
 
+import datetime
 import json
 from typing import List, Dict, Optional
 from .config import Config, SYSTEM_PROMPTS
@@ -21,10 +22,60 @@ class ResponseGenerator:
     def set_rag_engine(self, rag_engine: RAGEngine):
         self.rag_engine = rag_engine
 
+    def _fallback_categorization(self, query: str) -> Dict:
+        return {
+            "category": "General Inquiry",
+            "priority": "medium",
+            "sentiment": "neutral",
+            "summary": query[:100],
+        }
+
+    def _normalize_categorization(self, raw: Dict, query: str) -> Dict:
+        """
+        Coerce raw LLM output into the exact shape the rest of the system
+        expects. The model is free-form text, so it can return an unknown
+        category, a priority like "High Priority", or omit a field entirely —
+        downstream code (SLA lookup, priority badges) assumes valid values.
+        """
+        fallback = self._fallback_categorization(query)
+        if not isinstance(raw, dict):
+            return fallback
+
+        # Category — match case-insensitively against the configured list
+        category = str(raw.get("category", "")).strip()
+        by_lower = {c.lower(): c for c in Config.TICKET_CATEGORIES}
+        category = by_lower.get(category.lower(), fallback["category"])
+
+        # Priority — accept values like "High" or "urgent priority"
+        priority_text = str(raw.get("priority", "")).strip().lower()
+        priority = next(
+            (p for p in Config.PRIORITY_LEVELS if p in priority_text),
+            fallback["priority"],
+        )
+
+        # Sentiment
+        sentiment_text = str(raw.get("sentiment", "")).strip().lower()
+        sentiment = next(
+            (s for s in ("positive", "negative", "neutral") if s in sentiment_text),
+            fallback["sentiment"],
+        )
+
+        summary = str(raw.get("summary", "")).strip() or fallback["summary"]
+
+        return {
+            "category": category,
+            "priority": priority,
+            "sentiment": sentiment,
+            "summary": summary,
+        }
+
     def categorize_ticket(self, query: str) -> Dict:
         """
         Categorize a ticket: returns category, priority, sentiment, summary.
         Always processes in English.
+
+        The returned category is always one of Config.TICKET_CATEGORIES and the
+        priority is always a key of Config.PRIORITY_SLA, whatever the LLM says.
         """
         prompt = SYSTEM_PROMPTS["categorization"].format(
             categories=", ".join(Config.TICKET_CATEGORIES)
@@ -32,22 +83,29 @@ class ResponseGenerator:
 
         try:
             response_text = self.llm.generate(prompt, temperature=0.1)
+        except Exception as e:
+            print(f"⚠️ Categorization LLM call failed: {e}")
+            return self._fallback_categorization(query)
 
-            # Strip markdown code fences if present
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in response_text:
-                response_text = response_text.split("```")[1].split("```")[0].strip()
+        # Strip markdown code fences if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
 
-            return json.loads(response_text)
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError:
+            # Models sometimes wrap the object in prose — grab the outer braces
+            start, end = response_text.find("{"), response_text.rfind("}")
+            if start == -1 or end <= start:
+                return self._fallback_categorization(query)
+            try:
+                parsed = json.loads(response_text[start:end + 1])
+            except json.JSONDecodeError:
+                return self._fallback_categorization(query)
 
-        except (json.JSONDecodeError, Exception):
-            return {
-                "category": "General Inquiry",
-                "priority": "medium",
-                "sentiment": "neutral",
-                "summary": query[:100],
-            }
+        return self._normalize_categorization(parsed, query)
 
     def generate_self_help(self, query: str) -> str:
         """
@@ -135,19 +193,22 @@ class ResponseGenerator:
         except Exception:
             return original_response
 
-    def generate_with_analysis(self, query: str, user_lang: str = "en") -> Dict:
+    def generate_with_analysis(self, query: str, user_lang: Optional[str] = None) -> Dict:
         """
         Full pipeline: detect language → translate → categorize → RAG response
         → translate back → collect similar tickets.
 
         Args:
             query: Raw user query (any language)
-            user_lang: Detected language of the query
+            user_lang: Language of the query. Auto-detected when omitted, so
+                callers get multilingual behaviour without doing it themselves.
 
         Returns:
             Dict with: query, english_query, response, categorization,
                        similar_tickets, language
         """
+        user_lang = user_lang or detect_language(query)
+
         # Translate to English for processing
         english_query = translate_to_english(query, src_lang=user_lang) if user_lang != "en" else query
 
@@ -201,17 +262,20 @@ class FeedbackLoop:
             "improved_response": improved_response,
         }
 
+        feedback_id = None
         if self.db:
             try:
-                self.db.save_feedback(record)
-            except Exception:
-                self._memory_history.append(record)
-        else:
+                feedback_id = self.db.save_feedback(record)
+            except Exception as e:
+                print(f"⚠️ Could not persist feedback, keeping in memory: {e}")
+
+        if feedback_id is None:
             self._memory_history.append(record)
+            feedback_id = str(len(self._memory_history))
 
         return {
             "improved_response": improved_response,
-            "feedback_id": len(self._memory_history),
+            "feedback_id": feedback_id,
         }
 
     def get_feedback_history(self) -> List[Dict]:
@@ -221,3 +285,26 @@ class FeedbackLoop:
             except Exception:
                 pass
         return self._memory_history
+
+    def export_feedback(self, path: str = "feedback_export.json") -> str:
+        """
+        Write the full feedback history to a JSON file.
+
+        Args:
+            path: Destination file path
+
+        Returns:
+            The path written to.
+        """
+        history = self.get_feedback_history()
+
+        def _encode(value):
+            # Mongo records carry datetimes, which json cannot serialise
+            if isinstance(value, datetime.datetime):
+                return value.isoformat()
+            return str(value)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False, default=_encode)
+
+        return path
