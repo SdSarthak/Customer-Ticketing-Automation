@@ -57,6 +57,7 @@ class FAISSVectorStore:
 
         embeddings = []
         ids = []
+        skipped = 0
 
         # Continue numbering from what is already indexed so a second
         # add_documents() call appends instead of shadowing earlier entries.
@@ -70,10 +71,15 @@ class FAISSVectorStore:
 
             # Normalize for cosine similarity
             norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
+            if norm == 0:
+                # Blank source text, or an embedding call that failed. Such a
+                # vector can never match anything, so indexing it would only
+                # inflate the document count and make a broken build look fine.
+                skipped += 1
+                continue
+            embedding = embedding / norm
 
-            doc_id = next_id + offset
+            doc_id = next_id + len(ids)
             embeddings.append(embedding)
             ids.append(doc_id)
 
@@ -81,16 +87,24 @@ class FAISSVectorStore:
             self.id_to_doc[doc_id] = doc
             self.documents.append(doc)
 
+        if skipped:
+            print(f"⚠️ Skipped {skipped} document(s) with an empty embedding")
+
+        if not embeddings:
+            print("⚠️ No documents had a usable embedding — nothing was indexed")
+            return
+
         # Convert to numpy arrays
         embeddings_array = np.array(embeddings, dtype=np.float32)
         ids_array = np.array(ids, dtype=np.int64)
-        
+
         # Add to index
         self.index.add_with_ids(embeddings_array, ids_array)
-        
-        print(f"✅ Added {len(documents)} documents to vector store")
+
+        print(f"✅ Added {len(embeddings)} documents to vector store")
         print(f"📊 Total documents in store: {self.index.ntotal}")
-        
+
+
     def search(self, query_embedding: np.ndarray, 
                top_k: int = 5,
                threshold: float = 0.0) -> List[Tuple[Dict, float]]:

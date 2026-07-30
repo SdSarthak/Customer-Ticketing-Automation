@@ -452,6 +452,120 @@ class TestVectorStore:
         assert store.get_stats()["total_documents"] == 0
         assert store.documents == []
 
+    def test_zero_embedding_documents_are_not_indexed(self):
+        import numpy as np
+        store = _store(0)
+        store.add_documents([
+            {"id": "blank", "embedding": np.zeros(DIM, dtype="float32")},
+            {"id": "real", "embedding": np.ones(DIM, dtype="float32")},
+        ])
+        # A zero vector matches nothing, so counting it would hide a broken build
+        assert store.get_stats()["total_documents"] == 1
+        assert [d["id"] for d in store.documents] == ["real"]
+
+    def test_ids_stay_contiguous_when_documents_are_skipped(self):
+        import numpy as np
+        store = _store(0)
+        store.add_documents([
+            {"id": "blank", "embedding": np.zeros(DIM, dtype="float32")},
+            {"id": "real", "embedding": np.ones(DIM, dtype="float32")},
+        ])
+        # The kept document must own id 0 — a gap would desync id_to_doc
+        assert store.id_to_doc[0]["id"] == "real"
+        results = store.search(np.ones(DIM, dtype="float32"), top_k=1)
+        assert results[0][0]["id"] == "real"
+
+    def test_all_zero_batch_indexes_nothing(self):
+        import numpy as np
+        store = _store(0)
+        store.add_documents([
+            {"id": str(i), "embedding": np.zeros(DIM, dtype="float32")}
+            for i in range(3)
+        ])
+        assert store.get_stats()["total_documents"] == 0
+
+
+# ── EMBEDDINGS ────────────────────────────────────────────────────────────────
+
+def _embedder(side_effect):
+    """Build a GeminiEmbeddings whose underlying API call is mocked."""
+    from src.embeddings import GeminiEmbeddings
+
+    with patch("src.embeddings.genai.Client"):
+        embedder = GeminiEmbeddings(api_key="test-key")
+    embedder.embedding_dimension = 4
+    embedder.client.models.embed_content.side_effect = side_effect
+    return embedder
+
+
+def _ok(*_args, **_kwargs):
+    """A successful embed_content response carrying a unit vector."""
+    result = MagicMock()
+    result.embeddings = [MagicMock(values=[1.0, 0.0, 0.0, 0.0])]
+    return result
+
+
+def _boom(*_args, **_kwargs):
+    raise RuntimeError("401 invalid api key")
+
+
+class TestEmbeddings:
+    def test_requires_an_api_key(self):
+        from src.embeddings import GeminiEmbeddings
+        with patch.object(Config, "GOOGLE_API_KEY", ""):
+            with pytest.raises(ValueError, match="API key"):
+                GeminiEmbeddings()
+
+    def test_query_embedding_degrades_to_zero_vector(self):
+        import numpy as np
+        embedder = _embedder(_boom)
+        # A failed lookup must not 500 the request — the store skips zero vectors
+        assert not np.any(embedder.create_query_embedding("hello"))
+
+    def test_document_embedding_degrades_to_zero_vector(self):
+        import numpy as np
+        assert not np.any(_embedder(_boom).create_embedding("hello"))
+
+    def test_blank_text_needs_no_api_call(self):
+        embedder = _embedder(_ok)
+        embedder.create_embedding("   ")
+        embedder.client.models.embed_content.assert_not_called()
+
+    def test_embed_documents_aborts_when_every_call_fails(self):
+        from src.embeddings import EmbeddingError
+        embedder = _embedder(_boom)
+        docs = [{"combined_text": f"doc {i}"} for i in range(10)]
+        with pytest.raises(EmbeddingError, match="consecutive embedding calls failed"):
+            embedder.embed_documents(docs)
+
+    def test_embed_documents_stops_before_burning_the_corpus(self):
+        from src.embeddings import EmbeddingError
+        embedder = _embedder(_boom)
+        docs = [{"combined_text": f"doc {i}"} for i in range(50)]
+        with pytest.raises(EmbeddingError):
+            embedder.embed_documents(docs)
+        assert embedder.client.models.embed_content.call_count == \
+            embedder.FAIL_FAST_THRESHOLD
+
+    def test_embed_documents_tolerates_one_transient_failure(self):
+        import numpy as np
+        embedder = _embedder([RuntimeError("boom"), _ok(), _ok(), _ok()])
+        docs = [{"combined_text": f"doc {i}"} for i in range(4)]
+        embedder.embed_documents(docs)
+        # The one failure yields a zero vector; the rest embed normally
+        assert not np.any(docs[0]["embedding"])
+        assert all(np.any(d["embedding"]) for d in docs[1:])
+
+    def test_success_resets_the_consecutive_failure_counter(self):
+        embedder = _embedder([
+            RuntimeError("boom"), RuntimeError("boom"), _ok(),
+            RuntimeError("boom"), RuntimeError("boom"), _ok(),
+        ])
+        docs = [{"combined_text": f"doc {i}"} for i in range(6)]
+        # Never 3 in a row, so the run completes despite 4 total failures
+        embedder.embed_documents(docs)
+        assert embedder._failed_total == 4
+
 
 # ── RAG ENGINE ────────────────────────────────────────────────────────────────
 
