@@ -13,10 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.config import Config
 from src.data_loader import DataLoader
-from src.embeddings import GeminiEmbeddings
-from src.vector_store import FAISSVectorStore
 from src.rag_engine import RAGEngine
 from src.response_generator import ResponseGenerator, FeedbackLoop
+from src.db import MongoDBClient
+from src.translator import detect_language, get_language_name
 
 
 # Page configuration
@@ -79,6 +79,28 @@ def initialize_session_state():
         st.session_state.is_initialized = False
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
+    if 'db' not in st.session_state:
+        st.session_state.db = None
+
+
+def get_db():
+    """
+    Lazily connect to MongoDB, caching the client in session state.
+
+    Returns None when MongoDB is unreachable so the dashboard degrades to the
+    RAG-only tabs instead of erroring out.
+    """
+    if st.session_state.db is not None:
+        return st.session_state.db
+    try:
+        client = MongoDBClient()
+        client.connect()
+        st.session_state.db = client
+        return client
+    except Exception as e:
+        st.session_state.db = None
+        st.session_state.db_error = str(e)
+        return None
 
 
 def load_system(data_path: str = None):
@@ -112,9 +134,10 @@ def load_system(data_path: str = None):
                 st.warning("⚠️ No data source found. Please upload a CSV file or provide data path.")
                 return False
             
-            # Initialize response generator
+            # Initialize response generator — feedback persists to MongoDB
+            # when it is reachable, otherwise it stays in memory.
             response_generator = ResponseGenerator(rag_engine=rag_engine)
-            feedback_loop = FeedbackLoop(response_generator)
+            feedback_loop = FeedbackLoop(response_generator, db_client=get_db())
             
             # Store in session state
             st.session_state.rag_engine = rag_engine
@@ -260,27 +283,32 @@ def render_main_content():
         return
     
     # Main tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "💬 Support Chat", 
-        "📊 Ticket Analysis", 
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "💬 Support Chat",
+        "🎫 Ticket Queue",
+        "📊 Ticket Analysis",
         "🔄 Response Sampling",
         "📝 Feedback & History"
     ])
-    
+
     # Tab 1: Support Chat
     with tab1:
         render_chat_interface()
-    
-    # Tab 2: Ticket Analysis
+
+    # Tab 2: Ticket queue (admin/agent view backed by MongoDB)
     with tab2:
-        render_analysis_interface()
-    
-    # Tab 3: Response Sampling
+        render_ticket_queue()
+
+    # Tab 3: Ticket Analysis
     with tab3:
-        render_sampling_interface()
-    
-    # Tab 4: Feedback History
+        render_analysis_interface()
+
+    # Tab 4: Response Sampling
     with tab4:
+        render_sampling_interface()
+
+    # Tab 5: Feedback History
+    with tab5:
         render_feedback_interface()
 
 
@@ -302,25 +330,42 @@ def render_chat_interface():
         use_rag = st.checkbox("Use RAG context", value=True)
     
     if generate_btn and user_query:
-        with st.spinner("🤔 Analyzing query and generating response..."):
-            # Get complete analysis
-            result = st.session_state.response_generator.generate_with_analysis(user_query)
+        try:
+            with st.spinner("🤔 Analyzing query and generating response..."):
+                generator = st.session_state.response_generator
+                if use_rag:
+                    # Full pipeline: auto-detects language, translates,
+                    # categorizes and grounds the answer in similar tickets.
+                    result = generator.generate_with_analysis(user_query)
+                else:
+                    # RAG disabled — answer from the LLM alone
+                    lang = detect_language(user_query)
+                    result = {
+                        "query": user_query,
+                        "english_query": user_query,
+                        "response": generator.generate_response(user_query, use_rag=False),
+                        "categorization": generator.categorize_ticket(user_query),
+                        "similar_tickets": [],
+                        "language": lang,
+                    }
             st.session_state.current_response = result
-            
+
             # Store in chat history
             st.session_state.chat_history.append({
                 "query": user_query,
                 "result": result
             })
-    
+        except Exception as e:
+            st.error(f"❌ Could not generate a response: {e}")
+
     # Display current response
     if st.session_state.current_response:
         result = st.session_state.current_response
-        
+
         # Categorization badges
         cat = result.get('categorization', {})
-        col1, col2, col3, col4 = st.columns(4)
-        
+        col1, col2, col3, col4, col5 = st.columns(5)
+
         with col1:
             st.metric("Category", cat.get('category', 'N/A'))
         with col2:
@@ -329,6 +374,8 @@ def render_chat_interface():
         with col3:
             st.metric("Sentiment", cat.get('sentiment', 'neutral').capitalize())
         with col4:
+            st.metric("Language", get_language_name(result.get('language', 'en')))
+        with col5:
             st.metric("Similar Tickets", len(result.get('similar_tickets', [])))
         
         st.divider()
@@ -357,6 +404,170 @@ def render_chat_interface():
                     """, unsafe_allow_html=True)
 
 
+STATUS_LABELS = {
+    "open": "🟠 Open",
+    "in_progress": "🔵 In Progress",
+    "resolved": "🟢 Resolved",
+}
+
+
+def render_ticket_queue():
+    """
+    Agent/admin view of the live ticket queue backed by MongoDB.
+
+    Lists every ticket with its AI categorization, lets an agent filter by
+    status/priority/category and move a ticket through its lifecycle.
+    """
+    st.subheader("🎫 Ticket Queue")
+
+    db = get_db()
+    if db is None:
+        st.warning(
+            "MongoDB is not reachable, so there is no ticket queue to show. "
+            "Set `MONGODB_URI` in your .env and make sure the server is running."
+        )
+        if st.session_state.get("db_error"):
+            st.caption(f"Connection error: {st.session_state.db_error}")
+        return
+
+    try:
+        tickets = db.get_all_tickets()
+        stats = db.get_ticket_stats()
+    except Exception as e:
+        st.error(f"❌ Could not read tickets: {e}")
+        return
+
+    # Headline metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Tickets", stats["total"])
+    col2.metric("Open", stats["by_status"].get("open", 0))
+    col3.metric("In Progress", stats["by_status"].get("in_progress", 0))
+    col4.metric("Resolved", stats["by_status"].get("resolved", 0))
+
+    if not tickets:
+        st.info("No tickets yet. Create one from the web frontend or the API.")
+        return
+
+    st.divider()
+
+    # Filters
+    fcol1, fcol2, fcol3 = st.columns(3)
+    status_filter = fcol1.selectbox(
+        "Status", ["All", "open", "in_progress", "resolved"], key="q_status"
+    )
+    priority_filter = fcol2.selectbox(
+        "Priority", ["All"] + list(Config.PRIORITY_SLA), key="q_priority"
+    )
+    category_filter = fcol3.selectbox(
+        "Category", ["All"] + Config.TICKET_CATEGORIES, key="q_category"
+    )
+
+    def _matches(t):
+        return (
+            (status_filter == "All" or t.get("status") == status_filter)
+            and (priority_filter == "All" or t.get("priority") == priority_filter)
+            and (category_filter == "All" or t.get("category") == category_filter)
+        )
+
+    filtered = [t for t in tickets if _matches(t)]
+    st.caption(f"Showing {len(filtered)} of {len(tickets)} tickets")
+
+    if not filtered:
+        st.info("No tickets match the current filters.")
+        return
+
+    # Summary table, sorted so the most urgent work surfaces first
+    rows = [
+        {
+            "Ticket": t.get("ticket_id", ""),
+            "Customer": t.get("user_name", ""),
+            "Category": t.get("category", ""),
+            "Priority": t.get("priority", ""),
+            "Sentiment": t.get("sentiment", ""),
+            "Status": t.get("status", ""),
+            "Created": t.get("created_at"),
+        }
+        for t in filtered
+    ]
+    df = pd.DataFrame(rows)
+    df["_rank"] = df["Priority"].map(Config.PRIORITY_LEVELS).fillna(99)
+    df = df.sort_values(["_rank", "Created"], ascending=[True, False]).drop(columns="_rank")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Ticket Detail")
+
+    ids = [t.get("ticket_id", "") for t in filtered]
+    selected_id = st.selectbox("Select a ticket", ids, key="q_selected")
+    ticket = next((t for t in filtered if t.get("ticket_id") == selected_id), None)
+    if not ticket:
+        return
+
+    dcol1, dcol2 = st.columns([2, 1])
+
+    with dcol1:
+        st.markdown(f"**Customer:** {ticket.get('user_name','')} "
+                    f"<{ticket.get('user_email','')}>")
+        lang = ticket.get("language", "en")
+        st.markdown(f"**Language:** {get_language_name(lang)}")
+        st.markdown("**Issue**")
+        st.info(ticket.get("issue_description", ""))
+        if ticket.get("summary"):
+            st.markdown(f"**AI Summary:** {ticket['summary']}")
+        st.markdown("**AI Response Sent to Customer**")
+        st.success(ticket.get("ai_response", "") or "—")
+
+        attempts = ticket.get("attempt_history") or []
+        if attempts:
+            with st.expander(f"Self-help attempts before escalation ({len(attempts)})"):
+                for i, attempt in enumerate(attempts, 1):
+                    st.write(f"{i}. {attempt}")
+
+        if ticket.get("screenshot_path"):
+            path = ticket["screenshot_path"]
+            if os.path.exists(path):
+                st.image(path, caption="Customer screenshot", width=420)
+            else:
+                st.caption(f"Screenshot recorded at {path} (file no longer on disk)")
+
+    with dcol2:
+        priority = ticket.get("priority", "medium")
+        st.markdown(
+            f"<span class='category-badge priority-{priority}'>{priority.upper()}</span>",
+            unsafe_allow_html=True,
+        )
+        st.metric("Category", ticket.get("category", "—"))
+        st.metric("Sentiment", str(ticket.get("sentiment", "—")).capitalize())
+        st.metric("SLA", f"{Config.PRIORITY_SLA.get(priority, 24)} h")
+        created = ticket.get("created_at")
+        if created:
+            st.caption(f"Created {created:%Y-%m-%d %H:%M} UTC"
+                       if hasattr(created, "strftime") else f"Created {created}")
+
+        st.divider()
+        current = ticket.get("status", "open")
+        options = list(STATUS_LABELS)
+        new_status = st.selectbox(
+            "Status",
+            options,
+            index=options.index(current) if current in options else 0,
+            format_func=lambda s: STATUS_LABELS[s],
+            key=f"status_{selected_id}",
+        )
+        if st.button("💾 Update Status", key=f"save_{selected_id}"):
+            if new_status == current:
+                st.info("Status unchanged.")
+            else:
+                try:
+                    if db.update_ticket_status(selected_id, new_status):
+                        st.success(f"{selected_id} → {STATUS_LABELS[new_status]}")
+                        st.rerun()
+                    else:
+                        st.error(f"Ticket {selected_id} not found.")
+                except Exception as e:
+                    st.error(f"❌ Update failed: {e}")
+
+
 def render_analysis_interface():
     """Render the ticket analysis interface"""
     st.subheader("📊 Ticket Analysis")
@@ -370,19 +581,23 @@ def render_analysis_interface():
     
     if st.button("🔍 Analyze Ticket", key="analyze_btn"):
         if query:
-            with st.spinner("Analyzing..."):
-                # Categorize
-                categorization = st.session_state.response_generator.categorize_ticket(query)
-                
-                # Query analysis
-                analysis = st.session_state.rag_engine.analyze_query(query)
-                
+            try:
+                with st.spinner("Analyzing..."):
+                    # Categorize
+                    categorization = st.session_state.response_generator.categorize_ticket(query)
+
+                    # Query analysis
+                    analysis = st.session_state.rag_engine.analyze_query(query)
+            except Exception as e:
+                st.error(f"❌ Analysis failed: {e}")
+                return
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 st.markdown("### 📋 Ticket Classification")
                 st.json(categorization)
-            
+
             with col2:
                 st.markdown("### 📈 Retrieval Analysis")
                 if analysis['has_results']:
@@ -478,17 +693,20 @@ def render_feedback_interface():
     if history:
         for i, record in enumerate(history, 1):
             with st.expander(f"Feedback #{i} (Rating: {record.get('rating', 'N/A')})"):
-                st.write(f"**Original:** {record['original_response'][:200]}...")
-                st.write(f"**Feedback:** {record['feedback']}")
-                st.write(f"**Improved:** {record['improved_response'][:200]}...")
+                st.write(f"**Original:** {str(record.get('original_response', ''))[:200]}...")
+                st.write(f"**Feedback:** {record.get('feedback', '')}")
+                st.write(f"**Improved:** {str(record.get('improved_response', ''))[:200]}...")
     else:
         st.info("No feedback submitted yet.")
     
     # Export button
     if history:
         if st.button("📥 Export Feedback"):
-            st.session_state.feedback_loop.export_feedback("feedback_export.json")
-            st.success("Feedback exported to feedback_export.json")
+            try:
+                path = st.session_state.feedback_loop.export_feedback("feedback_export.json")
+                st.success(f"Feedback exported to {path}")
+            except OSError as e:
+                st.error(f"❌ Export failed: {e}")
 
 
 def main():
