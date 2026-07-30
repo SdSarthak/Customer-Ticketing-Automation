@@ -5,15 +5,24 @@ Start with: uvicorn api:app --reload --port 8000
 Then open:  http://localhost:8000
 """
 
+import asyncio
 import os
-import shutil
+import re
 import json as _json
 import tempfile
-import asyncio
+import uuid
+from contextlib import asynccontextmanager
 from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    BackgroundTasks,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from src.config import Config
@@ -25,18 +34,6 @@ from src.email_service import EmailService
 from src.translator import detect_language, translate_to_english, translate_from_english, get_language_name
 from src.voice_input import transcribe_audio, get_language_code_for_speech
 
-# ─── App ─────────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="AI Customer Support API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # ─── Global singletons ───────────────────────────────────────────────────────
 
 rag_engine: Optional[RAGEngine] = None
@@ -46,8 +43,14 @@ db: Optional[MongoDBClient] = None
 email_service: Optional[EmailService] = None
 
 
-@app.on_event("startup")
-async def startup():
+def _startup_sync():
+    """
+    Build the service singletons.
+
+    Every step is individually guarded: a missing API key or an unreachable
+    MongoDB should leave the server running in a degraded mode that /status can
+    describe, rather than killing the process on boot.
+    """
     global rag_engine, response_generator, feedback_loop, db, email_service
 
     try:
@@ -103,6 +106,180 @@ async def startup():
     print("Server ready. Open http://localhost:8000")
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """
+    Startup/shutdown hook.
+
+    Uses the lifespan API rather than the removed @app.on_event decorator, and
+    runs the (blocking) index load on a thread so the event loop stays free.
+    """
+    await asyncio.to_thread(_startup_sync)
+    yield
+    if db:
+        try:
+            db.close()
+        except Exception as e:
+            print(f"WARNING: error closing MongoDB — {e}")
+
+
+# ─── App ─────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="AI Customer Support API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─── Shared guards & helpers ──────────────────────────────────────────────────
+
+UPLOAD_DIR = "uploads"
+MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024  # 5 MB
+ALLOWED_SCREENSHOT_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def _require_generator():
+    """
+    Every ticket/analysis route needs the LLM. Startup keeps the server alive
+    without it (so /status can explain what's wrong), so each route has to say
+    'unavailable' rather than blow up with an AttributeError on None.
+    """
+    if response_generator is None:
+        raise HTTPException(
+            503, "Response generator not available. Check GROQ_API_KEY and restart."
+        )
+    return response_generator
+
+
+def _require_rag():
+    if not rag_engine or not rag_engine.is_initialized:
+        raise HTTPException(
+            503, "RAG engine not ready. Check your API keys and restart."
+        )
+    return rag_engine
+
+
+def _validate_email(email: str) -> str:
+    email = (email or "").strip()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, f"'{email}' is not a valid email address")
+    return email
+
+
+def _save_screenshot(screenshot: UploadFile) -> Optional[str]:
+    """
+    Persist an uploaded screenshot under uploads/ and return its path.
+
+    The client-supplied filename is never trusted: it is reduced to a safe
+    extension and given a random stem, so a name like '../../src/config.py'
+    cannot escape the upload directory or overwrite project files.
+    """
+    if not screenshot or not screenshot.filename:
+        return None
+
+    ext = os.path.splitext(screenshot.filename)[1].lower()
+    if ext not in ALLOWED_SCREENSHOT_EXTS:
+        raise HTTPException(
+            400,
+            f"Unsupported screenshot type '{ext or 'unknown'}'. "
+            f"Allowed: {', '.join(sorted(ALLOWED_SCREENSHOT_EXTS))}",
+        )
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    path = os.path.join(UPLOAD_DIR, safe_name)
+
+    written = 0
+    with open(path, "wb") as f:
+        while chunk := screenshot.file.read(64 * 1024):
+            written += len(chunk)
+            if written > MAX_SCREENSHOT_BYTES:
+                f.close()
+                os.remove(path)
+                raise HTTPException(
+                    413,
+                    f"Screenshot exceeds the {MAX_SCREENSHOT_BYTES // (1024 * 1024)} MB limit",
+                )
+            f.write(chunk)
+
+    return path
+
+
+def _build_ticket(
+    user_name: str,
+    user_email: str,
+    issue_description: str,
+    category: Optional[str],
+    priority: Optional[str],
+    language: Optional[str],
+    attempt_history: List[str],
+    screenshot_path: Optional[str] = None,
+):
+    """
+    Shared ticket pipeline used by both the JSON and multipart endpoints:
+    detect language → translate → categorize → generate → persist.
+
+    Returns (ticket_id, ticket_data, ai_response_en).
+    """
+    generator = _require_generator()
+
+    if not issue_description or not issue_description.strip():
+        raise HTTPException(400, "issue_description must not be empty")
+
+    user_email = _validate_email(user_email)
+
+    lang = language or detect_language(issue_description)
+    english_issue = (
+        translate_to_english(issue_description, lang)
+        if lang != "en"
+        else issue_description
+    )
+
+    categorization = generator.categorize_ticket(english_issue)
+    final_category = category or categorization.get("category", "General Inquiry")
+    final_priority = (priority or categorization.get("priority", "medium")).lower()
+    if final_priority not in Config.PRIORITY_SLA:
+        final_priority = "medium"
+
+    ai_response_en = generator.generate_response(english_issue)
+    ai_response = (
+        translate_from_english(ai_response_en, lang) if lang != "en" else ai_response_en
+    )
+
+    ticket_data = {
+        "user_name": user_name,
+        "user_email": user_email,
+        "issue_description": issue_description,
+        "category": final_category,
+        "priority": final_priority,
+        "sentiment": categorization.get("sentiment", "neutral"),
+        "summary": categorization.get("summary", ""),
+        "ai_response": ai_response,
+        "screenshot_path": screenshot_path,
+        "attempt_history": attempt_history or [],
+        "language": lang,
+    }
+
+    ticket_id = "TKT-OFFLINE-0001"
+    if db:
+        try:
+            ticket_id = db.save_ticket(ticket_data)
+        except Exception as e:
+            print(f"WARNING: MongoDB save failed — {e}")
+
+    return ticket_id, ticket_data, ai_response_en
+
+
 # ─── Serve frontend ───────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -130,17 +307,21 @@ def get_status():
             pass
 
     rag_ok = rag_engine.is_initialized if rag_engine else False
+    llm_ok = response_generator is not None
     mongo_ok = db is not None and db._client is not None
 
     # The frontend shows d.status as the chip text
-    if rag_ok:
+    if rag_ok and llm_ok:
         status_text = f"Online · {docs_indexed} docs"
+    elif not llm_ok:
+        status_text = "Degraded — LLM not configured"
     else:
         status_text = "Degraded — RAG not ready"
 
     return {
         "status": status_text,
         "rag_initialized": rag_ok,
+        "llm_ready": llm_ok,
         "documents_indexed": docs_indexed,
         "mongodb_connected": mongo_ok,
         "email_configured": email_service._is_configured() if email_service else False,
@@ -164,8 +345,8 @@ def self_help(req: SelfHelpRequest):
     Frontend expects:
       { response: str, steps: list[str], language: str }
     """
-    if not rag_engine or not rag_engine.is_initialized:
-        raise HTTPException(503, "RAG engine not ready. Check your API keys and restart.")
+    _require_rag()
+    generator = _require_generator()
 
     raw_query = req.issue or req.query or ""
     if not raw_query.strip():
@@ -175,7 +356,7 @@ def self_help(req: SelfHelpRequest):
     english_query = translate_to_english(raw_query, lang) if lang != "en" else raw_query
 
     # Generate self-help text
-    steps_en = response_generator.generate_self_help(english_query)
+    steps_en = generator.generate_self_help(english_query)
 
     # Translate back if needed
     steps_text = translate_from_english(steps_en, lang) if lang != "en" else steps_en
@@ -221,54 +402,33 @@ class TicketRequest(BaseModel):
 
 
 @app.post("/tickets")
-def create_ticket(req: TicketRequest):
+def create_ticket(req: TicketRequest, background: BackgroundTasks):
     """
     Create a ticket (no screenshot). Frontend expects ticket_id in response.
+
+    Emails are queued as a background task — two SMTP round-trips would
+    otherwise add seconds to the response the customer is waiting on.
     """
-    lang = req.language or detect_language(req.issue_description)
-    english_issue = (
-        translate_to_english(req.issue_description, lang)
-        if lang != "en"
-        else req.issue_description
+    ticket_id, ticket_data, ai_response_en = _build_ticket(
+        user_name=req.user_name,
+        user_email=req.user_email,
+        issue_description=req.issue_description,
+        category=req.category,
+        priority=req.priority,
+        language=req.language,
+        attempt_history=req.attempt_history or [],
     )
 
-    categorization = response_generator.categorize_ticket(english_issue)
-    # Allow frontend-supplied category/priority to override LLM if provided
-    category = req.category or categorization.get("category", "General Inquiry")
-    priority = (req.priority or categorization.get("priority", "medium")).lower()
-
-    ai_response_en = response_generator.generate_response(english_issue)
-    ai_response = translate_from_english(ai_response_en, lang) if lang != "en" else ai_response_en
-
-    ticket_data = {
-        "user_name": req.user_name,
-        "user_email": req.user_email,
-        "issue_description": req.issue_description,
-        "category": category,
-        "priority": priority,
-        "sentiment": categorization.get("sentiment", "neutral"),
-        "summary": categorization.get("summary", ""),
-        "ai_response": ai_response,
-        "attempt_history": req.attempt_history or [],
-        "language": lang,
-    }
-
-    ticket_id = "TKT-OFFLINE-0001"
-    if db:
-        try:
-            ticket_id = db.save_ticket(ticket_data)
-        except Exception as e:
-            print(f"WARNING: MongoDB save failed — {e}")
-
-    _send_emails(ticket_id, ticket_data, ai_response_en, screenshot_path=None)
+    background.add_task(_send_emails, ticket_id, ticket_data, ai_response_en, None)
 
     return {
         "ticket_id": ticket_id,
-        "category": category,
-        "priority": priority,
-        "sentiment": categorization.get("sentiment", "neutral"),
-        "ai_response": ai_response,
-        "language": lang,
+        "category": ticket_data["category"],
+        "priority": ticket_data["priority"],
+        "sentiment": ticket_data["sentiment"],
+        "summary": ticket_data["summary"],
+        "ai_response": ticket_data["ai_response"],
+        "language": ticket_data["language"],
         "email_sent": email_service._is_configured() if email_service else False,
     }
 
@@ -277,6 +437,7 @@ def create_ticket(req: TicketRequest):
 
 @app.post("/tickets/with-screenshot")
 async def create_ticket_with_screenshot(
+    background: BackgroundTasks,
     user_name: str = Form(...),
     user_email: str = Form(...),
     issue_description: str = Form(...),
@@ -287,59 +448,38 @@ async def create_ticket_with_screenshot(
     screenshot: Optional[UploadFile] = File(None),
 ):
     """Create a ticket with optional screenshot attachment."""
-    screenshot_path = None
-    if screenshot and screenshot.filename:
-        upload_dir = "uploads"
-        os.makedirs(upload_dir, exist_ok=True)
-        screenshot_path = os.path.join(upload_dir, screenshot.filename)
-        with open(screenshot_path, "wb") as f:
-            shutil.copyfileobj(screenshot.file, f)
+    screenshot_path = _save_screenshot(screenshot)
 
     try:
-        history = _json.loads(attempt_history)
-    except Exception:
+        history = _json.loads(attempt_history or "[]")
+        if not isinstance(history, list):
+            history = []
+    except (ValueError, TypeError):
         history = []
 
-    lang = language or detect_language(issue_description)
-    english_issue = translate_to_english(issue_description, lang) if lang != "en" else issue_description
+    ticket_id, ticket_data, ai_response_en = _build_ticket(
+        user_name=user_name,
+        user_email=user_email,
+        issue_description=issue_description,
+        category=category,
+        priority=priority,
+        language=language,
+        attempt_history=history,
+        screenshot_path=screenshot_path,
+    )
 
-    categorization = response_generator.categorize_ticket(english_issue)
-    final_category = category or categorization.get("category", "General Inquiry")
-    final_priority = (priority or categorization.get("priority", "medium")).lower()
-
-    ai_response_en = response_generator.generate_response(english_issue)
-    ai_response = translate_from_english(ai_response_en, lang) if lang != "en" else ai_response_en
-
-    ticket_data = {
-        "user_name": user_name,
-        "user_email": user_email,
-        "issue_description": issue_description,
-        "category": final_category,
-        "priority": final_priority,
-        "sentiment": categorization.get("sentiment", "neutral"),
-        "summary": categorization.get("summary", ""),
-        "ai_response": ai_response,
-        "screenshot_path": screenshot_path,
-        "attempt_history": history,
-        "language": lang,
-    }
-
-    ticket_id = "TKT-OFFLINE-0001"
-    if db:
-        try:
-            ticket_id = db.save_ticket(ticket_data)
-        except Exception as e:
-            print(f"WARNING: MongoDB save failed — {e}")
-
-    _send_emails(ticket_id, ticket_data, ai_response_en, screenshot_path)
+    background.add_task(
+        _send_emails, ticket_id, ticket_data, ai_response_en, screenshot_path
+    )
 
     return {
         "ticket_id": ticket_id,
-        "category": final_category,
-        "priority": final_priority,
-        "sentiment": categorization.get("sentiment", "neutral"),
-        "ai_response": ai_response,
-        "language": lang,
+        "category": ticket_data["category"],
+        "priority": ticket_data["priority"],
+        "sentiment": ticket_data["sentiment"],
+        "summary": ticket_data["summary"],
+        "ai_response": ticket_data["ai_response"],
+        "language": ticket_data["language"],
         "email_sent": email_service._is_configured() if email_service else False,
         "screenshot_saved": screenshot_path is not None,
     }
@@ -411,37 +551,81 @@ def _clean_for_tts(text: str) -> str:
     return clean.strip()
 
 
-async def _text_to_mp3(text: str, lang: str) -> bytes:
-    """Convert text to WAV bytes using pyttsx3 (fully offline, no API needed).
-    Returns WAV audio — browsers handle it fine via Audio()."""
+def _pick_voice(voices, lang: str):
+    """
+    Best-effort match of an installed system voice to the reply language.
+
+    pyttsx3 exposes voices per platform with no common naming scheme, so this
+    checks the advertised `languages` list and then the voice id/name for the
+    language code. Falls back to the second installed voice (a female voice on
+    most Windows installs) and finally to whatever the default is.
+    """
+    if not voices:
+        return None
+
+    lang = (lang or "en").split("-")[0].lower()
+
+    for voice in voices:
+        langs = getattr(voice, "languages", None) or []
+        for entry in langs:
+            if isinstance(entry, bytes):
+                entry = entry.decode("utf-8", errors="ignore")
+            if str(entry).lower().lstrip("\x05").startswith(lang):
+                return voice
+
+    for voice in voices:
+        haystack = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+        if f"-{lang}" in haystack or f"_{lang}" in haystack:
+            return voice
+
+    return voices[1] if len(voices) > 1 else voices[0]
+
+
+def _synthesize_wav(text: str, lang: str) -> bytes:
+    """Blocking pyttsx3 synthesis. Runs in a worker thread, never inline."""
     import pyttsx3
-    import tempfile
-    import os
 
-    clean = _clean_for_tts(text)
-    if not clean:
-        raise RuntimeError("Empty TTS text")
-
-    tmp_path = tempfile.mktemp(suffix=".wav")
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
     try:
         engine = pyttsx3.init()
         engine.setProperty("rate", 160)
         engine.setProperty("volume", 1.0)
-        # Pick female voice (index 1 = Zira on Windows) if available
-        voices = engine.getProperty("voices")
-        if len(voices) > 1:
-            engine.setProperty("voice", voices[1].id)
-        engine.save_to_file(clean, tmp_path)
+
+        voice = _pick_voice(engine.getProperty("voices"), lang)
+        if voice is not None:
+            engine.setProperty("voice", voice.id)
+
+        engine.save_to_file(text, tmp_path)
         engine.runAndWait()
+
         with open(tmp_path, "rb") as f:
-            return f.read()
+            data = f.read()
+        if not data:
+            raise RuntimeError("TTS produced an empty audio file")
+        return data
     except Exception as e:
         raise RuntimeError(f"pyttsx3 TTS failed: {e}") from e
     finally:
         try:
             os.unlink(tmp_path)
-        except Exception:
+        except OSError:
             pass
+
+
+async def _text_to_mp3(text: str, lang: str) -> bytes:
+    """
+    Convert text to WAV bytes using pyttsx3 (fully offline, no API needed).
+    Returns WAV audio — browsers handle it fine via Audio().
+
+    pyttsx3 blocks for a second or more, so it is pushed onto a thread to keep
+    the event loop free for other requests.
+    """
+    clean = _clean_for_tts(text)
+    if not clean:
+        raise RuntimeError("Empty TTS text")
+
+    return await asyncio.to_thread(_synthesize_wav, clean, lang)
 
 
 @app.post("/voice-chat")
@@ -461,8 +645,8 @@ async def voice_chat(
       X-Response-Text: what the AI replied
       X-Language: detected language
     """
-    if not rag_engine or not rag_engine.is_initialized:
-        raise HTTPException(503, "RAG engine not ready")
+    _require_rag()
+    generator = _require_generator()
 
     audio_bytes = await audio.read()
     lang = language or "en"
@@ -480,7 +664,7 @@ async def voice_chat(
     # Step 2 — detect language from transcript, translate, RAG, translate back
     detected_lang = detect_language(transcript)
     english_query = translate_to_english(transcript, detected_lang) if detected_lang != "en" else transcript
-    steps_en = response_generator.generate_self_help(english_query)
+    steps_en = generator.generate_self_help(english_query)
     reply_text = translate_from_english(steps_en, detected_lang) if detected_lang != "en" else steps_en
 
     # Flatten numbered steps into prose for TTS (numbers sound odd spoken)
@@ -518,8 +702,24 @@ def get_all_tickets():
         return []
     try:
         return db.get_all_tickets()
-    except Exception:
+    except Exception as e:
+        print(f"WARNING: could not list tickets — {e}")
         return []
+
+
+@app.get("/tickets/stats")
+def get_ticket_stats():
+    """
+    Aggregate ticket counts for dashboards.
+    Declared before /tickets/{ticket_id} so 'stats' is not read as an ID.
+    """
+    if not db:
+        return {"total": 0, "by_status": {}, "by_priority": {}, "by_category": {}}
+    try:
+        return db.get_ticket_stats()
+    except Exception as e:
+        print(f"WARNING: could not compute ticket stats — {e}")
+        return {"total": 0, "by_status": {}, "by_priority": {}, "by_category": {}}
 
 
 @app.get("/tickets/by-email/{email}")
@@ -605,13 +805,19 @@ class AnalyzeRequest(BaseModel):
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     raw = req.issue or req.query or ""
-    if not raw:
+    if not raw.strip():
         raise HTTPException(400, "Provide 'issue' in request body")
+
+    generator = _require_generator()
+    ready = bool(rag_engine and rag_engine.is_initialized)
+
     lang = req.language or detect_language(raw)
     eq = translate_to_english(raw, lang) if lang != "en" else raw
     return {
-        "categorization": response_generator.categorize_ticket(eq),
-        "retrieval_analysis": rag_engine.analyze_query(eq) if rag_engine else {},
-        "similar_tickets": rag_engine.get_similar_tickets(eq) if rag_engine else [],
+        "categorization": generator.categorize_ticket(eq),
+        "retrieval_analysis": rag_engine.analyze_query(eq) if ready else {},
+        "similar_tickets": rag_engine.get_similar_tickets(eq) if ready else [],
         "language": lang,
+        "language_name": get_language_name(lang),
+        "english_query": eq,
     }
