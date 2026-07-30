@@ -51,27 +51,36 @@ class FAISSVectorStore:
         if self.index is None:
             self.create_index()
         
+        if not documents:
+            print("⚠️ No documents to add")
+            return
+
         embeddings = []
         ids = []
-        
-        for i, doc in enumerate(documents):
+
+        # Continue numbering from what is already indexed so a second
+        # add_documents() call appends instead of shadowing earlier entries.
+        next_id = max(self.id_to_doc, default=-1) + 1
+
+        for offset, doc in enumerate(documents):
             if "embedding" not in doc:
-                raise ValueError(f"Document {i} missing 'embedding' field")
-            
-            embedding = doc["embedding"]
-            
+                raise ValueError(f"Document {offset} missing 'embedding' field")
+
+            embedding = np.asarray(doc["embedding"], dtype=np.float32)
+
             # Normalize for cosine similarity
             norm = np.linalg.norm(embedding)
             if norm > 0:
                 embedding = embedding / norm
-            
+
+            doc_id = next_id + offset
             embeddings.append(embedding)
-            ids.append(i)
-            
+            ids.append(doc_id)
+
             # Store document mapping
-            self.id_to_doc[i] = doc
+            self.id_to_doc[doc_id] = doc
             self.documents.append(doc)
-        
+
         # Convert to numpy arrays
         embeddings_array = np.array(embeddings, dtype=np.float32)
         ids_array = np.array(ids, dtype=np.int64)
@@ -99,12 +108,18 @@ class FAISSVectorStore:
         if self.index is None or self.index.ntotal == 0:
             print("⚠️ Vector store is empty")
             return []
-        
+
         # Normalize query embedding
         norm = np.linalg.norm(query_embedding)
-        if norm > 0:
-            query_embedding = query_embedding / norm
-        
+        if norm == 0:
+            # GeminiEmbeddings returns a zero vector when the embedding call
+            # fails (bad API key, quota, network). Searching with it produces
+            # arbitrary neighbours at score 0, which look like real matches —
+            # better to return nothing and let the caller say so.
+            print("⚠️ Query embedding is empty — skipping search (check GOOGLE_API_KEY)")
+            return []
+        query_embedding = query_embedding / norm
+
         # Reshape for FAISS
         query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
         
@@ -223,20 +238,21 @@ def create_vector_store_from_documents(documents: List[Dict],
 if __name__ == "__main__":
     # Test vector store
     print("Testing FAISS Vector Store...")
-    
-    # Create dummy documents with embeddings
+
+    # Small dimension keeps the smoke test fast; the index adapts to it
+    DIM = 128
     test_docs = [
-        {"id": "1", "text": "Test document 1", "embedding": np.random.rand(768).astype(np.float32)},
-        {"id": "2", "text": "Test document 2", "embedding": np.random.rand(768).astype(np.float32)},
-        {"id": "3", "text": "Test document 3", "embedding": np.random.rand(768).astype(np.float32)},
+        {"id": str(i), "text": f"Test document {i}",
+         "embedding": np.random.rand(DIM).astype(np.float32)}
+        for i in range(1, 4)
     ]
-    
-    store = FAISSVectorStore()
+
+    store = FAISSVectorStore(embedding_dimension=DIM)
     store.create_index()
     store.add_documents(test_docs)
-    
+
     # Test search
-    query = np.random.rand(768).astype(np.float32)
+    query = np.random.rand(DIM).astype(np.float32)
     results = store.search(query, top_k=2)
     
     print(f"\nSearch results:")
