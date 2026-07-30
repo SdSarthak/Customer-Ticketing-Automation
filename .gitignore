@@ -1,6 +1,14 @@
 # Environment & secrets
 .env
+.env.local
+.env.*.local
 *.env
+!.env.example
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+client_secret*.json
 
 # Python
 __pycache__/
@@ -20,12 +28,32 @@ venv/
 env/
 .env/
 
-# Vector store (generated, rebuild with data loader)
+# Node
+node_modules/
+
+# Model checkpoints & serialized artefacts
+*.h5
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.joblib
+*.onnx
+*.safetensors
+
+# Databases
+*.sqlite3
+*.db
+
+# Vector store (generated — rebuild with `python main.py --setup`)
 vector_store/faiss_index.bin
 vector_store/metadata.pkl
 
 # Uploads (user-uploaded files, not for source control)
 uploads/
+
+# Generated exports
+feedback_export.json
 
 # Test/pytest cache
 .pytest_cache/
