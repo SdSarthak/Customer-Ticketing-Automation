@@ -1,38 +1,43 @@
-python-dotenv==1.0.0
-pandas==2.1.4
-numpy==1.26.2
+# Core
+python-dotenv>=1.0.0
+pandas>=2.1
+numpy>=1.26
 
-# Google Gemini (embeddings only)
-google-generativeai==0.3.2
+# Google Gemini embeddings — src/embeddings.py uses the `google.genai` client,
+# which ships in google-genai (NOT the older google-generativeai package).
+google-genai>=1.0.0
 
-# Groq (LLM)
-groq==0.9.0
+# Groq (LLM + Whisper speech-to-text)
+groq>=0.9.0
 
-# Vector Database
-faiss-cpu==1.7.3
+# Vector database
+# 1.7.x wheels are built against the numpy 1.x ABI and fail to import under
+# numpy 2 ("numpy.core.multiarray failed to import"); 1.9+ supports both.
+faiss-cpu>=1.9.0
 
 # MongoDB
-pymongo==4.6.1
+pymongo>=4.6
 
 # Multilingual support
-langdetect==1.0.9
-deep-translator==1.11.4
+langdetect>=1.0.9
+deep-translator>=1.11
 
-# Voice input
-SpeechRecognition==3.10.0
-audio-recorder-streamlit==0.0.8
+# Text-to-speech (offline, no API key required)
+pyttsx3>=2.90
 
-# Streamlit UI
-streamlit==1.29.0
+# Streamlit admin dashboard
+streamlit>=1.29
 
-# FastAPI backend (for custom frontend)
-fastapi==0.109.0
-uvicorn==0.27.0
-python-multipart==0.0.9
-aiofiles==23.2.1
-
-# TTS (edge-tts uses Microsoft neural voices, free, no key needed)
-edge-tts==6.1.12
+# FastAPI backend (serves index.html + REST API)
+fastapi>=0.109
+uvicorn>=0.27
+python-multipart>=0.0.9
+aiofiles>=23.2
 
 # Utilities
-tqdm==4.66.1
+tqdm>=4.66
+
+# Tests (pytest.ini sets asyncio_mode=auto; TestClient needs httpx)
+pytest>=7.4
+pytest-asyncio>=0.23
+httpx>=0.27
