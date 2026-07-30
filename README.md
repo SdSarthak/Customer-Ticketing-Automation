@@ -22,42 +22,42 @@ This system automates and augments customer support operations by:
 ### Prerequisites
 
 - Python 3.9+
-- MongoDB (local or Atlas)
-- API Keys: Google Gemini, Groq
-- Gmail account with App Password (2FA required)
+- API keys: Google Gemini (embeddings) and Groq (LLM + Whisper)
+- MongoDB — optional, for ticket persistence and the admin queue
+- Gmail account with an App Password — optional, for email notifications
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd "Major 8th sem"
+git clone https://github.com/SdSarthak/Customer-Ticketing-Automation.git
+cd Customer-Ticketing-Automation
 
-# Install dependencies
 pip install -r requirements.txt
 
-# Configure environment
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env and fill in GOOGLE_API_KEY and GROQ_API_KEY
 ```
 
 ### Running the System
 
 ```bash
-# Initialize the system (first run)
+# Build the FAISS index from the bundled dataset (first run only)
 python main.py --setup
 
-# Start FastAPI backend (primary interface)
+# Start the FastAPI backend — it also serves the web frontend
 uvicorn api:app --reload --port 8000
 # Visit: http://localhost:8000
 
-# Start Streamlit admin dashboard (optional)
+# Streamlit dashboard for agents and administrators (optional)
 streamlit run app.py
 # Visit: http://localhost:8501
 
 # CLI interactive mode
 python main.py --interactive
 ```
+
+The API degrades gracefully: if MongoDB is unreachable or a key is missing, the
+server still boots and `GET /status` reports exactly which subsystem is down.
 
 ---
 
@@ -67,10 +67,12 @@ python main.py --interactive
 User Request (Text / Voice)
         │
         ▼
-  Language Detection & Translation (langdetect + Google Translate)
+  Language Detection & Translation (langdetect + deep-translator)
         │
         ▼
   Self-Help Generation ──► FAISS Vector Search ──► Groq LLM
+        │
+        ├──► Unhelpful? ──► Feedback Loop ──► Improved Response
         │
         ▼
   Issue Unresolved? ──► Ticket Creation
@@ -79,7 +81,7 @@ User Request (Text / Voice)
   Categorization + Priority + Sentiment (Groq Llama 3.3 70B)
         │
         ├──► MongoDB (persistence)
-        ├──► Gmail (customer + developer notifications)
+        ├──► Gmail (customer + developer notifications, sent in background)
         └──► Response Translation & Delivery
 ```
 
@@ -88,11 +90,12 @@ User Request (Text / Voice)
 ## Project Structure
 
 ```
-Major 8th sem/
+.
 ├── main.py                     # CLI entry point
-├── api.py                      # FastAPI REST backend
+├── api.py                      # FastAPI REST backend (also serves index.html)
 ├── app.py                      # Streamlit admin dashboard
-├── test_api.py                 # Pytest test suite (40+ tests)
+├── test_api.py                 # Endpoint + voice pipeline tests
+├── test_src.py                 # Unit tests for the src/ modules
 ├── requirements.txt
 ├── .env.example
 ├── index.html                  # User-facing web frontend
@@ -131,24 +134,53 @@ Major 8th sem/
 | Multilingual Support | Auto-detects and translates 21+ languages |
 | Voice Interface | Full STT → RAG → TTS round-trip |
 | Ticket Intelligence | AI categorization, priority, sentiment, summary |
-| Feedback Loop | Users can rate and improve AI responses |
-| Email Notifications | HTML emails to customers and support team |
-| Admin Dashboard | Streamlit UI for agents and administrators |
+| Feedback Loop | Users rate an answer and the model rewrites it |
+| Email Notifications | HTML emails to customers and the support team |
+| Admin Dashboard | Streamlit ticket queue with filters and status updates |
 | Screenshot Attachments | Users can upload screenshots with tickets |
 
 ---
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GOOGLE_API_KEY` | Yes | Google Gemini API (embeddings) |
-| `GROQ_API_KEY` | Yes | Groq API (LLM + Whisper STT) |
-| `MONGODB_URI` | No | MongoDB connection string (default: localhost) |
-| `MONGODB_DB` | No | Database name (default: customer_support) |
-| `GMAIL_ADDRESS` | No | Gmail address for sending notifications |
-| `GMAIL_APP_PASSWORD` | No | Gmail App Password (not account password) |
-| `DEVELOPER_EMAIL` | No | Support team email for ticket alerts |
+A blank value (`MONGODB_URI=`) is treated as unset and falls back to the default.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GOOGLE_API_KEY` | Yes | — | Google Gemini API (embeddings) |
+| `GROQ_API_KEY` | Yes | — | Groq API (LLM + Whisper STT) |
+| `MONGODB_URI` | No | `mongodb://localhost:27017` | MongoDB connection string |
+| `MONGODB_DB` | No | `customer_support` | Database name |
+| `GMAIL_ADDRESS` | No | — | Gmail address for sending notifications |
+| `GMAIL_APP_PASSWORD` | No | — | Gmail App Password (not the account password) |
+| `DEVELOPER_EMAIL` | No | — | Support team email for ticket alerts |
+| `DATA_PATH` | No | `data/customer_support_tickets.csv` | Source dataset |
+| `VECTOR_STORE_PATH` | No | `vector_store` | Where the FAISS index is persisted |
+
+---
+
+## API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/` | Serves the web frontend |
+| `GET` | `/status` | Subsystem health (RAG, LLM, MongoDB, email) |
+| `POST` | `/self-help` | Self-help steps for an issue |
+| `POST` | `/tickets` | Create a ticket (JSON) |
+| `POST` | `/tickets/with-screenshot` | Create a ticket with an attachment |
+| `GET` | `/tickets` | List all tickets |
+| `GET` | `/tickets/stats` | Aggregate counts by status/priority/category |
+| `GET` | `/tickets/by-email/{email}` | Tickets for one customer |
+| `GET` | `/tickets/{ticket_id}` | Single ticket |
+| `PATCH` | `/tickets/{ticket_id}/status` | Move a ticket through its lifecycle |
+| `POST` | `/transcribe` | Audio → text |
+| `POST` | `/voice-chat` | Full STT → RAG → TTS round-trip |
+| `POST` | `/feedback` | Rate a response and get an improved one |
+| `GET` | `/feedback` | Feedback history |
+| `POST` | `/analyze` | Categorization + retrieval analysis |
+
+Full request/response schemas are in [docs/api.md](docs/api.md). Interactive
+docs are served at `/docs` while the server is running.
 
 ---
 
@@ -164,16 +196,34 @@ Major 8th sem/
 
 ## Testing
 
+The suite runs fully offline — Groq, Gemini, MongoDB and pyttsx3 are all mocked.
+
 ```bash
-# Run all tests
+# Run everything
+pytest -q
+
+# Endpoints only
 pytest test_api.py -v
 
-# Run specific test class
+# A single class
 pytest test_api.py::TestTickets -v
 
-# Run with coverage
-pytest test_api.py --cov=src --cov-report=html
+# With coverage
+pytest --cov=src --cov-report=html
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `numpy.core.multiarray failed to import` | `faiss-cpu` 1.7.x is built against numpy 1.x. `pip install -U "faiss-cpu>=1.9.0"` |
+| `Router.__init__() got an unexpected keyword argument 'on_startup'` | `fastapi` and `starlette` versions are mismatched. `pip install -U fastapi` |
+| `'charmap' codec can't encode character` | Legacy Windows code page. Handled automatically on `import src`; run inside a UTF-8 terminal if it persists |
+| `Empty host (or extra comma in host list)` | `MONGODB_URI=` is blank in `.env`. Remove the line or give it a real URI |
+| `/status` shows `Degraded — RAG not ready` | No FAISS index yet. Run `python main.py --setup` |
+| `401 Invalid API Key` in a response | `GROQ_API_KEY` or `GOOGLE_API_KEY` is expired — regenerate it |
 
 ---
 

@@ -10,7 +10,7 @@ All request bodies use `application/json` unless noted as multipart form data. A
 
 1. [System Status](#system-status)
 2. [Self-Help](#self-help)
-3. [Tickets](#tickets)
+3. [Tickets](#tickets) — including [GET /tickets/stats](#get-ticketsstats)
 4. [Voice](#voice)
 5. [Feedback](#feedback)
 6. [Analysis](#analysis)
@@ -30,31 +30,38 @@ Serves the user-facing HTML frontend (`index.html`).
 
 ### GET /status
 
-Returns the current health and readiness of all system components.
+Returns the current health and readiness of all system components. The server
+boots even when a subsystem is unavailable, so this endpoint is the way to find
+out what is actually working.
 
 **Response:**
 
 ```json
 {
-  "status": "operational",
-  "rag_ready": true,
-  "documents_indexed": 2500,
-  "services": {
-    "database": true,
-    "email": true,
-    "voice": true
-  }
+  "status": "Online · 108 docs",
+  "rag_initialized": true,
+  "llm_ready": true,
+  "documents_indexed": 108,
+  "mongodb_connected": true,
+  "email_configured": true,
+  "groq_configured": true,
+  "gemini_configured": true
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `"operational"` or `"degraded"` |
-| `rag_ready` | boolean | Whether the FAISS vector store is loaded |
-| `documents_indexed` | integer | Number of documents in vector store |
-| `services.database` | boolean | MongoDB connectivity |
-| `services.email` | boolean | Gmail SMTP configured |
-| `services.voice` | boolean | Groq Whisper available |
+| `status` | string | Human-readable summary shown in the frontend chip |
+| `rag_initialized` | boolean | Whether the FAISS vector store is loaded |
+| `llm_ready` | boolean | Whether the response generator was constructed |
+| `documents_indexed` | integer | Number of documents in the vector store |
+| `mongodb_connected` | boolean | MongoDB connectivity |
+| `email_configured` | boolean | Gmail SMTP credentials present |
+| `groq_configured` | boolean | `GROQ_API_KEY` is set |
+| `gemini_configured` | boolean | `GOOGLE_API_KEY` is set |
+
+`status` reads `"Online · N docs"` when healthy, otherwise
+`"Degraded — LLM not configured"` or `"Degraded — RAG not ready"`.
 
 ---
 
@@ -213,7 +220,7 @@ Same as `POST /tickets` but accepts a screenshot attachment. Uses `multipart/for
 | `priority` | string | No | Optional override |
 | `language` | string | No | Language code |
 | `attempt_history` | string | No | Prior attempts |
-| `screenshot` | file | No | Image file (PNG, JPG, GIF) |
+| `screenshot` | file | No | Image file — `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, max 5 MB |
 
 **Response:** Same as `POST /tickets`, with additional field:
 
@@ -224,6 +231,16 @@ Same as `POST /tickets` but accepts a screenshot attachment. Uses `multipart/for
   ...
 }
 ```
+
+**Screenshot handling:** the uploaded filename is never used on disk. Each file
+is stored under `uploads/` with a generated random name and its original
+extension, so a crafted name such as `../../src/config.py` cannot escape the
+upload directory or overwrite project files.
+
+| HTTP Status | Scenario |
+|-------------|----------|
+| `400 Bad Request` | Extension not in the allowed list |
+| `413 Payload Too Large` | File exceeds 5 MB |
 
 ---
 
@@ -254,6 +271,30 @@ Retrieve all tickets. Intended for admin/agent use.
 ```
 
 Results are sorted by `created_at` descending (newest first).
+
+Returns `[]` rather than an error when MongoDB is unavailable.
+
+---
+
+### GET /tickets/stats
+
+Aggregate ticket counts, used by the Streamlit dashboard and any custom admin UI.
+
+Declared before `/tickets/{ticket_id}` so `stats` is never interpreted as a
+ticket ID.
+
+**Response:**
+
+```json
+{
+  "total": 128,
+  "by_status": { "open": 40, "in_progress": 18, "resolved": 70 },
+  "by_priority": { "urgent": 6, "high": 22, "medium": 71, "low": 29 },
+  "by_category": { "Billing": 44, "Technical Support": 51, "General Inquiry": 33 }
+}
+```
+
+Returns zeroed counters when MongoDB is unavailable.
 
 ---
 
@@ -508,10 +549,15 @@ All errors follow the standard FastAPI error format:
 
 | HTTP Status | Scenario |
 |-------------|----------|
-| `400 Bad Request` | Missing required fields, invalid field values |
+| `400 Bad Request` | Missing required fields, invalid email, unsupported file type |
 | `404 Not Found` | Ticket ID does not exist |
-| `422 Unprocessable Entity` | Request body schema validation failure |
-| `500 Internal Server Error` | Unexpected server-side error (LLM failure, DB unavailable) |
+| `413 Payload Too Large` | Screenshot exceeds the 5 MB limit |
+| `422 Unprocessable Entity` | Request body schema validation failure, or audio that could not be transcribed |
+| `503 Service Unavailable` | A required subsystem is down — RAG not initialized, LLM not configured, MongoDB unreachable, or speech-to-text failing |
+| `500 Internal Server Error` | Unexpected server-side error |
+
+`503` is the normal response when the server booted without valid API keys.
+Check `GET /status` to see which subsystem is missing.
 
 ---
 
