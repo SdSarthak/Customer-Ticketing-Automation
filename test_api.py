@@ -8,7 +8,8 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 
-pytestmark = pytest.mark.asyncio
+# pytest.ini sets asyncio_mode=auto, so async tests are collected automatically.
+# A module-level pytest.mark.asyncio would also (wrongly) tag every sync test.
 
 
 def _make_rag(initialized=True):
@@ -54,6 +55,15 @@ def _make_email():
     return es
 
 
+def _voice(language, voice_id="voice"):
+    """Build a stand-in for a pyttsx3 voice object."""
+    v = MagicMock()
+    v.languages = [language]
+    v.id = voice_id
+    v.name = voice_id
+    return v
+
+
 @pytest.fixture()
 def client():
     rag = _make_rag()
@@ -66,23 +76,23 @@ def client():
 
     import api
 
-    async def _noop_startup():
-        pass
-
-    api.app.router.on_startup = [_noop_startup]
-    api.rag_engine         = rag
-    api.response_generator = rg
-    api.feedback_loop      = fl
-    api.db                 = db
-    api.email_service      = es
-
-    with TestClient(api.app) as c:
+    # Skip the real startup (it would hit MongoDB, Gemini and Groq) and inject
+    # the doubles instead. The patch has to stay active for the whole client
+    # lifetime because lifespan startup runs inside the `with` block.
+    with patch("api._startup_sync"):
         api.rag_engine         = rag
         api.response_generator = rg
         api.feedback_loop      = fl
         api.db                 = db
         api.email_service      = es
-        yield c
+
+        with TestClient(api.app) as c:
+            api.rag_engine         = rag
+            api.response_generator = rg
+            api.feedback_loop      = fl
+            api.db                 = db
+            api.email_service      = es
+            yield c
 
 
 # ── STATUS ────────────────────────────────────────────────────────────────────
@@ -184,6 +194,84 @@ class TestTickets:
         files = {"screenshot": ("screen.png", io.BytesIO(b"fakepng"), "image/png")}
         r = client.post("/tickets/with-screenshot", data=data, files=files)
         assert r.status_code == 200 and "ticket_id" in r.json()
+
+    def test_invalid_email_returns_400(self, client):
+        bad = {**VALID_TICKET, "user_email": "not-an-email"}
+        assert client.post("/tickets", json=bad).status_code == 400
+
+    def test_empty_description_returns_400(self, client):
+        blank = {**VALID_TICKET, "issue_description": "   "}
+        assert client.post("/tickets", json=blank).status_code == 400
+
+    def test_unknown_priority_is_normalized(self, client):
+        weird = {**VALID_TICKET, "priority": "CATASTROPHIC"}
+        assert client.post("/tickets", json=weird).json()["priority"] == "medium"
+
+    def test_generator_unavailable_returns_503(self, client):
+        import api
+        orig = api.response_generator
+        api.response_generator = None
+        try:
+            assert client.post("/tickets", json=VALID_TICKET).status_code == 503
+        finally:
+            api.response_generator = orig
+
+    def test_stats_endpoint_not_read_as_ticket_id(self, client):
+        import api
+        api.db.get_ticket_stats.return_value = {
+            "total": 3, "by_status": {"open": 3}, "by_priority": {}, "by_category": {}
+        }
+        r = client.get("/tickets/stats")
+        assert r.status_code == 200 and r.json()["total"] == 3
+
+
+class TestScreenshotUpload:
+    BASE = {"user_name": "Test", "user_email": "t@t.com", "issue_description": "Broken"}
+
+    def _post(self, client, filename, content=b"fakepng", ctype="image/png"):
+        return client.post(
+            "/tickets/with-screenshot",
+            data=self.BASE,
+            files={"screenshot": (filename, io.BytesIO(content), ctype)},
+        )
+
+    def test_traversal_filename_cannot_escape_uploads(self, client, tmp_path, monkeypatch):
+        import api, os
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(tmp_path / "uploads"))
+        r = self._post(client, "../../src/config.py")
+        # Rejected outright: .py is not an allowed screenshot type
+        assert r.status_code == 400
+        assert not (tmp_path.parent / "config.py").exists()
+
+    def test_traversal_with_image_extension_is_contained(self, client, tmp_path, monkeypatch):
+        import api, os
+        upload_dir = tmp_path / "uploads"
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(upload_dir))
+        r = self._post(client, "../../../evil.png")
+        assert r.status_code == 200
+        written = list(upload_dir.iterdir())
+        assert len(written) == 1
+        # Original name discarded, file stays inside the upload directory
+        assert written[0].name != "evil.png"
+        assert written[0].parent == upload_dir
+
+    def test_disallowed_extension_returns_400(self, client, tmp_path, monkeypatch):
+        import api
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(tmp_path / "uploads"))
+        assert self._post(client, "payload.exe").status_code == 400
+
+    def test_oversized_screenshot_returns_413(self, client, tmp_path, monkeypatch):
+        import api
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(tmp_path / "uploads"))
+        monkeypatch.setattr(api, "MAX_SCREENSHOT_BYTES", 1024)
+        r = self._post(client, "big.png", content=b"x" * 5000)
+        assert r.status_code == 413
+        assert list((tmp_path / "uploads").iterdir()) == []
+
+    def test_ticket_without_screenshot_still_works(self, client):
+        r = client.post("/tickets/with-screenshot", data=self.BASE)
+        assert r.status_code == 200
+        assert r.json()["screenshot_saved"] is False
 
 
 # ── TRANSCRIBE ────────────────────────────────────────────────────────────────
@@ -333,18 +421,46 @@ class TestTTS:
         assert "**" not in result and "`" not in result
 
     async def test_tts_returns_wav(self, tmp_path):
+        import os
         fake_wav = b"RIFF" + b"\x00" * 100
         wav_file = tmp_path / "out.wav"
         wav_file.write_bytes(fake_wav)
 
         mock_engine = MagicMock()
         mock_engine.getProperty.side_effect = lambda k: (
-            [MagicMock(), MagicMock()] if k == "voices" else 160
+            [_voice("en-US"), _voice("hi-IN")] if k == "voices" else 160
         )
 
+        fd = os.open(str(tmp_path / "unused.tmp"), os.O_CREAT | os.O_RDWR)
         with patch("pyttsx3.init", return_value=mock_engine), \
-             patch("tempfile.mktemp", return_value=str(wav_file)):
+             patch("api.tempfile.mkstemp", return_value=(fd, str(wav_file))):
             from api import _text_to_mp3
             result = await _text_to_mp3("Hello world", "en")
 
         assert result == fake_wav
+
+    async def test_empty_text_raises(self):
+        from api import _text_to_mp3
+        with pytest.raises(RuntimeError):
+            await _text_to_mp3("   ", "en")
+
+
+class TestVoiceSelection:
+    def test_matches_language_tag(self):
+        from api import _pick_voice
+        voices = [_voice("en-US"), _voice("hi-IN")]
+        assert _pick_voice(voices, "hi") is voices[1]
+
+    def test_matches_bytes_language_tag(self):
+        from api import _pick_voice
+        voices = [_voice(b"\x05en-US"), _voice(b"\x05fr-FR")]
+        assert _pick_voice(voices, "fr") is voices[1]
+
+    def test_falls_back_when_no_match(self):
+        from api import _pick_voice
+        voices = [_voice("en-US"), _voice("en-GB")]
+        assert _pick_voice(voices, "ja") is voices[1]
+
+    def test_empty_voice_list_returns_none(self):
+        from api import _pick_voice
+        assert _pick_voice([], "en") is None
