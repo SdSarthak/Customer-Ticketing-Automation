@@ -21,8 +21,15 @@ class EmailService:
         gmail_address: Optional[str] = None,
         app_password: Optional[str] = None,
     ):
-        self.gmail_address = gmail_address or Config.GMAIL_ADDRESS
-        self.app_password = app_password or Config.GMAIL_APP_PASSWORD
+        # Only fall back to the environment when an argument is omitted.
+        # `or` would ignore an explicit "" and silently re-enable sending,
+        # which makes the service impossible to switch off deliberately.
+        self.gmail_address = (
+            Config.GMAIL_ADDRESS if gmail_address is None else gmail_address
+        )
+        self.app_password = (
+            Config.GMAIL_APP_PASSWORD if app_password is None else app_password
+        )
 
     def _is_configured(self) -> bool:
         return bool(self.gmail_address and self.app_password)
