@@ -67,37 +67,54 @@ class DataLoader:
         print(f"✅ Preprocessing complete. {len(df)} records ready.")
         return df
     
-    def create_documents(self, instruction_col: str = "instruction", 
+    def create_documents(self, instruction_col: str = "instruction",
                         response_col: str = "response",
-                        category_col: Optional[str] = None) -> List[Dict]:
+                        category_col: Optional[str] = "category") -> List[Dict]:
         """
         Create document dictionaries for embedding
-        
+
         Args:
             instruction_col: Column name for customer instructions/queries
             response_col: Column name for support responses
-            category_col: Optional column name for ticket categories
-            
+            category_col: Column name for ticket categories. Defaults to
+                "category" and is silently ignored when the CSV has no such
+                column, so datasets with only instruction/response still work.
+
         Returns:
             List of document dictionaries
         """
         if self.processed_data is None:
             self.preprocess_data()
-        
-        documents = []
+
         df = self.processed_data
-        
+
+        missing = [c for c in (instruction_col, response_col) if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Data file {self.data_path} is missing required column(s): "
+                f"{', '.join(missing)}. Found: {', '.join(df.columns)}"
+            )
+
+        # Only use the category column if it is actually present
+        has_category = bool(category_col) and category_col in df.columns
+
+        documents = []
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Creating documents"):
+            instruction = str(row[instruction_col] or "")
+            response = str(row[response_col] or "")
+            category = str(row[category_col] or "General") if has_category else "General"
             doc = {
                 "id": str(idx),
-                "instruction": row.get(instruction_col, ""),
-                "response": row.get(response_col, ""),
-                "category": row.get(category_col, "General") if category_col else "General",
-                "combined_text": f"Customer Query: {row.get(instruction_col, '')}\nSupport Response: {row.get(response_col, '')}"
+                "instruction": instruction,
+                "response": response,
+                "category": category,
+                "combined_text": f"Customer Query: {instruction}\nSupport Response: {response}"
             }
             documents.append(doc)
-        
+
         print(f"✅ Created {len(documents)} documents for embedding")
+        if not has_category:
+            print(f"ℹ️ No '{category_col}' column found — all documents tagged 'General'")
         return documents
     
     def get_statistics(self) -> Dict:
