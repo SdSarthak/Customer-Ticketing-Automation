@@ -5,11 +5,39 @@ Generates customer support responses using Groq LLM with RAG context
 
 import datetime
 import json
-from typing import List, Dict, Optional
+import re
+from typing import Iterable, List, Dict, Optional
 from .config import Config, SYSTEM_PROMPTS
 from .llm_client import GroqClient
 from .rag_engine import RAGEngine
 from .translator import detect_language, translate_to_english, translate_from_english
+
+
+def _match_label(text: str, options: Iterable[str], fallback: str) -> str:
+    """
+    Pick the label that best describes a free-form LLM value.
+
+    An exact match wins. Otherwise the label whose whole word appears *earliest*
+    wins, because scanning the option list in its own order made
+    "low (not urgent)" resolve to "urgent" — the first option that happened to
+    be a substring, not the one the model actually chose.
+    """
+    text = (text or "").strip().lower()
+    if not text:
+        return fallback
+
+    options = list(options)
+    for option in options:
+        if text == option:
+            return option
+
+    hits = []
+    for option in options:
+        found = re.search(rf"\b{re.escape(option)}\b", text)
+        if found:
+            hits.append((found.start(), option))
+
+    return min(hits)[1] if hits else fallback
 
 
 class ResponseGenerator:
@@ -47,16 +75,14 @@ class ResponseGenerator:
         category = by_lower.get(category.lower(), fallback["category"])
 
         # Priority — accept values like "High" or "urgent priority"
-        priority_text = str(raw.get("priority", "")).strip().lower()
-        priority = next(
-            (p for p in Config.PRIORITY_LEVELS if p in priority_text),
-            fallback["priority"],
+        priority = _match_label(
+            str(raw.get("priority", "")), Config.PRIORITY_LEVELS, fallback["priority"]
         )
 
         # Sentiment
-        sentiment_text = str(raw.get("sentiment", "")).strip().lower()
-        sentiment = next(
-            (s for s in ("positive", "negative", "neutral") if s in sentiment_text),
+        sentiment = _match_label(
+            str(raw.get("sentiment", "")),
+            ("positive", "negative", "neutral"),
             fallback["sentiment"],
         )
 

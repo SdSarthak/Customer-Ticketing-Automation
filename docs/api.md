@@ -179,6 +179,16 @@ Create a new support ticket. The system automatically categorizes, prioritizes, 
 - `medium` — SLA: 24 hours
 - `low` — SLA: 72 hours
 
+**Field limits** (exceeding any of these returns `400`):
+
+| Field | Limit |
+|-------|-------|
+| `user_name` | 200 characters, must not be blank |
+| `issue_description` | 20 000 characters, must not be blank |
+| `attempt_history` | first 20 entries, 2 000 characters each; blank entries dropped |
+
+Text fields are trimmed before storage.
+
 **Response:**
 
 ```json
@@ -246,7 +256,18 @@ upload directory or overwrite project files.
 
 ### GET /tickets
 
-Retrieve all tickets. Intended for admin/agent use.
+Retrieve recent tickets, newest first. Intended for admin/agent use.
+
+**Query Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `limit` | integer | `200` | Page size. Values above `1000` are clamped to `1000`. |
+| `skip` | integer | `0` | Number of tickets to skip, for paging. |
+
+The listing is always bounded — request further pages with `skip` rather than
+expecting a single response to contain every ticket. Use
+[`GET /tickets/stats`](#get-ticketsstats) for the true total.
 
 **Response:**
 
@@ -272,7 +293,8 @@ Retrieve all tickets. Intended for admin/agent use.
 
 Results are sorted by `created_at` descending (newest first).
 
-Returns `[]` rather than an error when MongoDB is unavailable.
+Returns `[]` rather than an error when MongoDB is unavailable, and
+`400 Bad Request` when `limit < 1` or `skip < 0`.
 
 ---
 
@@ -300,9 +322,11 @@ Returns zeroed counters when MongoDB is unavailable.
 
 ### GET /tickets/by-email/{email}
 
-Retrieve all tickets submitted by a specific customer email.
+Retrieve a customer's most recent tickets, newest first.
 
 **Path Parameter:** `email` — URL-encoded email address
+
+**Query Parameter:** `limit` — page size, default `200`, clamped to `1000`
 
 **Response:** Array of ticket objects (same schema as GET /tickets items).
 
@@ -367,8 +391,15 @@ Transcribe an audio recording to text using Groq Whisper.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `audio` | file | Yes | Audio file (webm, wav, mp3, m4a) |
+| `audio` | file | Yes | Audio file (webm, wav, mp3, m4a), max 15 MB |
 | `language` | string | No | BCP-47 language code hint (default: `"en-US"`) |
+
+| HTTP Status | Scenario |
+|-------------|----------|
+| `400 Bad Request` | Empty upload — no audio bytes were sent |
+| `413 Payload Too Large` | Audio exceeds the 15 MB limit |
+| `422 Unprocessable Entity` | Audio was transcribed but produced no text |
+| `503 Service Unavailable` | Speech-to-text is unavailable (missing `GROQ_API_KEY`, API error) |
 
 **Response:**
 
@@ -390,9 +421,12 @@ Full voice interaction round-trip: audio input → transcription → RAG self-he
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `audio` | file | Yes | Audio file (webm format preferred) |
+| `audio` | file | Yes | Audio file (webm format preferred), max 15 MB |
 | `language` | string | No | BCP-47 language code (default: `"en-US"`) |
 | `attempt` | integer | No | Attempt number (for retry tracking) |
+
+Speech synthesis is serialised process-wide: `pyttsx3` hands out a single shared
+engine, so concurrent requests queue rather than corrupt each other's audio.
 
 **Response:** `audio/wav` stream
 
@@ -549,9 +583,9 @@ All errors follow the standard FastAPI error format:
 
 | HTTP Status | Scenario |
 |-------------|----------|
-| `400 Bad Request` | Missing required fields, invalid email, unsupported file type |
+| `400 Bad Request` | Missing required fields, invalid email, unsupported file type, over-long text, empty upload, bad paging arguments |
 | `404 Not Found` | Ticket ID does not exist |
-| `413 Payload Too Large` | Screenshot exceeds the 5 MB limit |
+| `413 Payload Too Large` | Screenshot exceeds 5 MB, or audio exceeds 15 MB |
 | `422 Unprocessable Entity` | Request body schema validation failure, or audio that could not be transcribed |
 | `503 Service Unavailable` | A required subsystem is down — RAG not initialized, LLM not configured, MongoDB unreachable, or speech-to-text failing |
 | `500 Internal Server Error` | Unexpected server-side error |

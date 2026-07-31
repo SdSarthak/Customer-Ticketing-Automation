@@ -263,6 +263,39 @@ class TestCategorization:
         gen = _generator(json.dumps({"category": "Billing", "priority": "low"}))
         assert gen.categorize_ticket("broken invoice")["summary"] == "broken invoice"
 
+    def test_qualified_priority_does_not_pick_the_qualifier(self):
+        """Scanning the option list in order made this resolve to 'urgent'."""
+        gen = _generator(json.dumps({
+            "category": "Billing", "priority": "low (not urgent)",
+            "sentiment": "neutral", "summary": "s",
+        }))
+        assert gen.categorize_ticket("q")["priority"] == "low"
+
+    def test_qualified_sentiment_does_not_pick_the_qualifier(self):
+        gen = _generator(json.dumps({
+            "category": "Billing", "priority": "low",
+            "sentiment": "neutral, not negative", "summary": "s",
+        }))
+        assert gen.categorize_ticket("q")["sentiment"] == "neutral"
+
+    def test_priority_word_must_stand_alone(self):
+        """'lower' must not be read as 'low'."""
+        gen = _generator(json.dumps({
+            "category": "Billing", "priority": "lowercase nonsense",
+            "sentiment": "neutral", "summary": "s",
+        }))
+        assert gen.categorize_ticket("q")["priority"] == "medium"
+
+    def test_exact_priority_wins_over_position(self):
+        from src.response_generator import _match_label
+        assert _match_label("high", Config.PRIORITY_LEVELS, "medium") == "high"
+        assert _match_label("HIGH ", Config.PRIORITY_LEVELS, "medium") == "high"
+
+    def test_blank_priority_uses_the_fallback(self):
+        from src.response_generator import _match_label
+        assert _match_label("", Config.PRIORITY_LEVELS, "medium") == "medium"
+        assert _match_label("   ", Config.PRIORITY_LEVELS, "medium") == "medium"
+
 
 # ── FEEDBACK LOOP ─────────────────────────────────────────────────────────────
 
