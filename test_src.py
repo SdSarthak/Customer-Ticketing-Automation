@@ -708,6 +708,108 @@ class TestEmailService:
             )
         assert len(send.call_args[0][0].get_payload()) == 2
 
+    def test_customer_email_escapes_html_in_user_fields(self):
+        """A customer name/response containing markup must not become live HTML."""
+        from src.email_service import EmailService
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with patch.object(service, "_send", return_value=True) as send:
+            service.send_customer_confirmation(
+                to_email="c@example.com",
+                user_name="<script>alert(1)</script>",
+                ticket_id="TKT-42", category="Billing", priority="urgent",
+                ai_response="</div><img src=x onerror=alert(2)>",
+                sla_hours=2,
+            )
+        body = send.call_args[0][0].get_payload(0).get_payload(decode=True).decode()
+        assert "<script>" not in body
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
+        assert "<img" not in body
+        assert "&lt;img src=x onerror=alert(2)&gt;" in body
+
+    def test_developer_alert_escapes_issue_and_attempts(self):
+        from src.email_service import EmailService
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with patch.object(Config, "DEVELOPER_EMAIL", "dev@example.com"), \
+             patch.object(service, "_send", return_value=True) as send:
+            service.send_developer_alert(
+                ticket_id="TKT-1", user_name="<b>C</b>", user_email="c@example.com",
+                issue_description="<iframe src=evil></iframe>",
+                category="Billing", priority="low", sentiment="neutral",
+                ai_response="ok", attempt_history=["<script>x</script>"],
+            )
+        body = send.call_args[0][0].get_payload(0).get_payload(decode=True).decode()
+        assert "<iframe" not in body
+        assert "<script>x</script>" not in body
+        assert "&lt;b&gt;C&lt;/b&gt;" in body
+
+    def test_newlines_in_issue_still_render_as_breaks(self):
+        from src.email_service import EmailService
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with patch.object(Config, "DEVELOPER_EMAIL", "dev@example.com"), \
+             patch.object(service, "_send", return_value=True) as send:
+            service.send_developer_alert(
+                ticket_id="TKT-1", user_name="C", user_email="c@example.com",
+                issue_description="line one\nline two", category="Billing",
+                priority="low", sentiment="neutral", ai_response="y",
+            )
+        body = send.call_args[0][0].get_payload(0).get_payload(decode=True).decode()
+        assert "line one<br>line two" in body
+
+    def test_subject_cannot_carry_injected_headers(self):
+        from src.email_service import EmailService
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with patch.object(service, "_send", return_value=True) as send:
+            service.send_customer_confirmation(
+                to_email="c@example.com", user_name="C",
+                ticket_id="TKT-1\r\nBcc: attacker@evil.com",
+                category="Billing", priority="low", ai_response="y", sla_hours=8,
+            )
+        msg = send.call_args[0][0]
+        assert "\n" not in msg["Subject"] and "\r" not in msg["Subject"]
+        assert msg["Bcc"] is None
+
+    def test_invalid_recipient_is_rejected(self):
+        from src.email_service import EmailService
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with pytest.raises(ValueError):
+            service.send_customer_confirmation(
+                to_email="not-an-email", user_name="C", ticket_id="TKT-1",
+                category="Billing", priority="low", ai_response="y", sla_hours=8,
+            )
+
+    def test_oversized_screenshot_is_not_attached(self, tmp_path):
+        from src.email_service import EmailService
+        import src.email_service as email_module
+
+        shot = tmp_path / "big.png"
+        shot.write_bytes(b"0" * 2048)
+
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with patch.object(email_module, "MAX_ATTACHMENT_BYTES", 1024), \
+             patch.object(Config, "DEVELOPER_EMAIL", "dev@example.com"), \
+             patch.object(service, "_send", return_value=True) as send:
+            service.send_developer_alert(
+                ticket_id="TKT-1", user_name="C", user_email="c@example.com",
+                issue_description="x", category="Billing", priority="low",
+                sentiment="neutral", ai_response="y", screenshot_path=str(shot),
+            )
+        # body only — the oversized attachment was dropped, not sent
+        assert len(send.call_args[0][0].get_payload()) == 1
+
+    def test_missing_screenshot_path_does_not_raise(self):
+        from src.email_service import EmailService
+        service = EmailService(gmail_address="a@gmail.com", app_password="pw")
+        with patch.object(Config, "DEVELOPER_EMAIL", "dev@example.com"), \
+             patch.object(service, "_send", return_value=True) as send:
+            sent = service.send_developer_alert(
+                ticket_id="TKT-1", user_name="C", user_email="c@example.com",
+                issue_description="x", category="Billing", priority="low",
+                sentiment="neutral", ai_response="y",
+                screenshot_path="does/not/exist.png",
+            )
+        assert sent is True
+        assert len(send.call_args[0][0].get_payload()) == 1
+
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
