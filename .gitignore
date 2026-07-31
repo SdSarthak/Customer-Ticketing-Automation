@@ -51,6 +51,7 @@ vector_store/metadata.pkl
 
 # Uploads (user-uploaded files, not for source control)
 uploads/
+data/uploaded_tickets.csv
 
 # Generated exports
 feedback_export.json

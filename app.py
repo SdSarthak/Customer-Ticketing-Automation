@@ -103,8 +103,15 @@ def get_db():
         return None
 
 
-def load_system(data_path: str = None):
-    """Load and initialize the support system"""
+def load_system(data_path: str = None, force_rebuild: bool = False):
+    """
+    Load and initialize the support system.
+
+    `force_rebuild` skips the cached FAISS index and re-embeds `data_path`.
+    Without it, "Initialize with New Data" found the existing index on disk and
+    loaded that instead — the freshly uploaded CSV was never indexed and the
+    dashboard kept answering from the old corpus.
+    """
     try:
         with st.spinner("🔄 Initializing AI Support System..."):
             # Check for API key
@@ -115,7 +122,11 @@ def load_system(data_path: str = None):
             # Check if vector store exists
             vector_store_path = Config.VECTOR_STORE_PATH
             
-            if os.path.exists(os.path.join(vector_store_path, "faiss_index.bin")):
+            index_exists = os.path.exists(
+                os.path.join(vector_store_path, "faiss_index.bin")
+            )
+
+            if index_exists and not force_rebuild:
                 # Load existing vector store
                 st.info("📂 Loading existing vector store...")
                 rag_engine = RAGEngine()
@@ -153,22 +164,44 @@ def load_system(data_path: str = None):
         return False
 
 
+UPLOADED_DATA_PATH = os.path.join("data", "uploaded_tickets.csv")
+
+
 def process_uploaded_file(uploaded_file):
-    """Process an uploaded CSV file"""
+    """
+    Persist an uploaded CSV and confirm it is usable.
+
+    Written to `data/uploaded_tickets.csv`, never to the path the bundled
+    dataset lives at: the previous version overwrote
+    `data/customer_support_tickets.csv` with whatever the user picked, which
+    destroyed the shipped data on the first upload with no way back.
+
+    The file is validated before it is accepted, so a spreadsheet with the
+    wrong columns fails here rather than half-way through an embedding run
+    that costs real API calls.
+    """
+    file_path = UPLOADED_DATA_PATH
     try:
-        # Save uploaded file
-        data_dir = "data"
-        os.makedirs(data_dir, exist_ok=True)
-        file_path = os.path.join(data_dir, "customer_support_tickets.csv")
-        
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
-        
+
+        # Fail fast on an unreadable or wrongly-shaped CSV
+        loader = DataLoader(file_path)
+        loader.load_data()
+        loader.create_documents()
+
         st.session_state.data_loaded = True
         return file_path
-        
+
     except Exception as e:
-        st.error(f"❌ Error processing file: {str(e)}")
+        st.error(f"❌ Could not use that file: {e}")
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        st.session_state.data_loaded = False
         return None
 
 
@@ -205,7 +238,7 @@ def render_sidebar():
             st.sidebar.success("✅ File uploaded")
             if st.sidebar.button("🔄 Initialize with New Data"):
                 st.session_state.is_initialized = False
-                load_system(file_path)
+                load_system(file_path, force_rebuild=True)
     
     # Initialize button
     if not st.session_state.is_initialized:
@@ -470,7 +503,12 @@ def render_ticket_queue():
         )
 
     filtered = [t for t in tickets if _matches(t)]
-    st.caption(f"Showing {len(filtered)} of {len(tickets)} tickets")
+    # get_all_tickets() returns a bounded page, so say so rather than implying
+    # `len(tickets)` is the whole collection when stats["total"] is larger.
+    caption = f"Showing {len(filtered)} of {len(tickets)} loaded tickets"
+    if stats["total"] > len(tickets):
+        caption += f" (most recent {len(tickets)} of {stats['total']} total)"
+    st.caption(caption)
 
     if not filtered:
         st.info("No tickets match the current filters.")

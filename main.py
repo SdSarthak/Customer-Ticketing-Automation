@@ -55,7 +55,11 @@ def initialize_system(data_path: str = None, force_rebuild: bool = False):
         # Load existing
         print("\n🔄 Loading existing vector store...")
         rag_engine = RAGEngine()
-        rag_engine.load_from_disk(vector_store_path)
+        try:
+            rag_engine.load_from_disk(vector_store_path)
+        except (ValueError, FileNotFoundError, OSError) as e:
+            print(f"\n❌ The saved vector store could not be loaded: {e}")
+            return None
         print(f"✅ Loaded {rag_engine.vector_store.get_stats()['total_documents']} documents")
         return rag_engine
     
@@ -67,16 +71,21 @@ def initialize_system(data_path: str = None, force_rebuild: bool = False):
         print("Please provide a valid CSV file path.")
         return None
     
-    # Load and process data
-    loader = DataLoader(data_path)
-    loader.load_data()
-    
-    print("\n📈 Data Statistics:")
-    stats = loader.get_statistics()
-    print(f"  Total records: {stats['total_records']}")
-    print(f"  Columns: {stats['columns']}")
-    
-    documents = loader.create_documents()
+    # Load and process data. A malformed CSV (empty, header-only, wrong
+    # columns, no usable rows) should read as a clear message, not a traceback.
+    try:
+        loader = DataLoader(data_path)
+        loader.load_data()
+
+        print("\n📈 Data Statistics:")
+        stats = loader.get_statistics()
+        print(f"  Total records: {stats['total_records']}")
+        print(f"  Columns: {stats['columns']}")
+
+        documents = loader.create_documents()
+    except (ValueError, FileNotFoundError, OSError) as e:
+        print(f"\n❌ Could not read {data_path}: {e}")
+        return None
 
     # Initialize RAG engine. Embedding the corpus is the one step that costs
     # real API calls, so surface its failures as a readable message instead of
