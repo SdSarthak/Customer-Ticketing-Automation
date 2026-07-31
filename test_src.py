@@ -1297,3 +1297,246 @@ class TestTranslator:
             assert _positive_float("T_TEST", 8.0) == 8.0
         with patch.dict(os.environ, {"T_TEST": "2.5"}):
             assert _positive_float("T_TEST", 8.0) == 2.5
+
+
+# -- VOICE INPUT ---------------------------------------------------------------
+
+class TestSpeechLanguageCodes:
+    def test_known_codes_are_mapped(self):
+        from src.voice_input import get_language_code_for_speech
+        assert get_language_code_for_speech("hi") == "hi-IN"
+        assert get_language_code_for_speech("zh-cn") == "zh-CN"
+
+    def test_missing_code_falls_back_to_english(self):
+        from src.voice_input import get_language_code_for_speech
+        # None used to raise AttributeError, "" produced the nonsense tag "-"
+        assert get_language_code_for_speech(None) == "en-US"
+        assert get_language_code_for_speech("") == "en-US"
+        assert get_language_code_for_speech("   ") == "en-US"
+
+    def test_unknown_code_gets_a_plausible_tag(self):
+        from src.voice_input import get_language_code_for_speech
+        assert get_language_code_for_speech("ur") == "ur-UR"
+
+    def test_existing_bcp47_tag_is_normalised_not_doubled(self):
+        from src.voice_input import get_language_code_for_speech
+        assert get_language_code_for_speech("pt-br") == "pt-BR"
+
+
+class TestTranscribeAudio:
+    def _groq(self, result="  hello there  "):
+        client = MagicMock()
+        client.audio.transcriptions.create.return_value = result
+        return client
+
+    def test_missing_api_key_raises(self):
+        from src.voice_input import transcribe_audio
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(RuntimeError, match="GROQ_API_KEY"):
+                transcribe_audio(b"audio")
+
+    def test_empty_audio_returns_none_without_calling_the_api(self):
+        from src.voice_input import transcribe_audio
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch("groq.Groq") as groq_cls:
+            assert transcribe_audio(b"") is None
+        groq_cls.assert_not_called()
+
+    def test_transcript_is_stripped(self):
+        from src.voice_input import transcribe_audio
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch("groq.Groq", return_value=self._groq()):
+            assert transcribe_audio(b"audio-bytes") == "hello there"
+
+    def test_whitespace_only_transcript_becomes_none(self):
+        from src.voice_input import transcribe_audio
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch("groq.Groq", return_value=self._groq("   ")):
+            assert transcribe_audio(b"audio-bytes") is None
+
+    def test_bcp47_hint_is_reduced_to_iso_code(self):
+        from src.voice_input import transcribe_audio
+        client = self._groq()
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch("groq.Groq", return_value=client):
+            transcribe_audio(b"audio-bytes", language="hi-IN")
+        assert client.audio.transcriptions.create.call_args.kwargs["language"] == "hi"
+
+    def test_api_failure_is_wrapped_in_runtime_error(self):
+        from src.voice_input import transcribe_audio
+        client = MagicMock()
+        client.audio.transcriptions.create.side_effect = OSError("network down")
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch("groq.Groq", return_value=client):
+            with pytest.raises(RuntimeError, match="transcription failed"):
+                transcribe_audio(b"audio-bytes")
+
+    def test_temp_file_is_removed_even_when_the_api_fails(self, tmp_path, monkeypatch):
+        """The audio is spooled to disk; a failed call must not leave it there."""
+        import src.voice_input as vi
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("TEMP", str(tmp_path))
+        monkeypatch.setenv("TMP", str(tmp_path))
+
+        client = MagicMock()
+        client.audio.transcriptions.create.side_effect = OSError("network down")
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}, clear=False), \
+             patch("groq.Groq", return_value=client):
+            with pytest.raises(RuntimeError):
+                vi.transcribe_audio(b"audio-bytes")
+
+        assert list(tmp_path.glob("*.webm")) == []
+
+    def test_object_response_uses_its_text_attribute(self):
+        from src.voice_input import transcribe_audio
+        reply = SimpleNamespace(text=" spoken ")
+        with patch.dict(os.environ, {"GROQ_API_KEY": "k"}), \
+             patch("groq.Groq", return_value=self._groq(reply)):
+            assert transcribe_audio(b"audio-bytes") == "spoken"
+
+
+# -- END-TO-END INDEX BUILD (bundled CSV, offline embedder) --------------------
+
+class _HashingEmbedder:
+    """
+    Deterministic offline stand-in for GeminiEmbeddings.
+
+    Bag-of-words hashing, so overlapping text really does land close together
+    in the index -- enough to assert that retrieval works end to end without a
+    network call. crc32 is used because Python str hashing is salted per
+    process and would make the test flaky.
+    """
+
+    def __init__(self, dim=64):
+        self.embedding_dimension = dim
+
+    def _vec(self, text):
+        import numpy as np
+        import re as _re
+        import zlib
+
+        vec = np.zeros(self.embedding_dimension, dtype="float32")
+        for token in _re.findall(r"[a-z0-9]+", (text or "").lower()):
+            vec[zlib.crc32(token.encode()) % self.embedding_dimension] += 1.0
+        return vec
+
+    def embed_documents(self, documents, text_field="combined_text"):
+        for doc in documents:
+            doc["embedding"] = self._vec(doc.get(text_field, ""))
+        return documents
+
+    def create_query_embedding(self, text):
+        return self._vec(text)
+
+
+@pytest.fixture(scope="module")
+def bundled_engine():
+    """RAG engine built from the real data/customer_support_tickets.csv."""
+    from src.rag_engine import RAGEngine
+    from src.vector_store import FAISSVectorStore
+
+    csv_path = os.path.join(os.path.dirname(__file__), "data",
+                            "customer_support_tickets.csv")
+    if not os.path.exists(csv_path):
+        pytest.skip("bundled dataset not present")
+
+    loader = DataLoader(csv_path)
+    loader.load_data()
+    documents = loader.create_documents()
+
+    embedder = _HashingEmbedder()
+    engine = RAGEngine(
+        embedder=embedder,
+        vector_store=FAISSVectorStore(embedding_dimension=embedder.embedding_dimension),
+    )
+    engine.initialize_from_documents(documents)
+    return engine, documents
+
+
+class TestEndToEndIndex:
+    """
+    Exercises DataLoader -> embeddings -> FAISS -> RAGEngine against the real
+    bundled CSV. The other retrieval tests use three synthetic vectors, so an
+    index-build regression could not be caught by them.
+    """
+
+    def test_every_row_reaches_the_index(self, bundled_engine):
+        engine, documents = bundled_engine
+        assert len(documents) > 0
+        assert engine.vector_store.get_stats()["total_documents"] == len(documents)
+        assert engine.is_initialized is True
+
+    def test_ids_map_back_to_the_right_documents(self, bundled_engine):
+        engine, documents = bundled_engine
+        store = engine.vector_store
+        assert len(store.id_to_doc) == len(documents)
+        for doc_id, doc in store.id_to_doc.items():
+            assert documents[doc_id]["id"] == doc["id"]
+
+    def test_retrieval_finds_the_matching_ticket(self, bundled_engine):
+        engine, _ = bundled_engine
+        results = engine.retrieve("How do I reset my password?", top_k=3, threshold=0.0)
+        assert results, "no results for a query taken from the corpus"
+        assert "password" in results[0][0]["instruction"].lower()
+
+    def test_similar_tickets_carry_scores_and_categories(self, bundled_engine):
+        engine, _ = bundled_engine
+        tickets = engine.get_similar_tickets(
+            "Where is my order? It's been 2 weeks since I placed it.", top_k=3
+        )
+        assert tickets, "a verbatim corpus query cleared no similarity threshold"
+        assert "order" in tickets[0]["instruction"].lower()
+        assert all(0.0 <= t["similarity_score"] <= 1.0001 for t in tickets)
+        assert all(t["category"] for t in tickets)
+
+    def test_categories_survive_the_round_trip_into_the_index(self, bundled_engine):
+        engine, _ = bundled_engine
+        indexed = {d["category"] for d in engine.vector_store.id_to_doc.values()}
+        assert indexed <= set(Config.TICKET_CATEGORIES) | {"General"}
+        assert len(indexed) > 1, "every document collapsed to one category"
+
+    def test_context_string_is_built_from_real_documents(self, bundled_engine):
+        engine, _ = bundled_engine
+        context = engine.get_context("I want a refund for my order", top_k=2)
+        assert "Customer Query:" in context and "Support Response:" in context
+        assert context != "No relevant context found."
+
+    def test_saved_index_reloads_and_still_retrieves(self, bundled_engine, tmp_path):
+        from src.rag_engine import RAGEngine
+        from src.vector_store import FAISSVectorStore
+
+        engine, _ = bundled_engine
+        engine.save_to_disk(str(tmp_path))
+
+        embedder = _HashingEmbedder()
+        reloaded = RAGEngine(
+            embedder=embedder,
+            vector_store=FAISSVectorStore(embedding_dimension=embedder.embedding_dimension),
+        )
+        reloaded.load_from_disk(str(tmp_path))
+
+        assert (reloaded.vector_store.get_stats()["total_documents"]
+                == engine.vector_store.get_stats()["total_documents"])
+        before = engine.retrieve("How do I reset my password?", top_k=3, threshold=0.0)
+        after = reloaded.retrieve("How do I reset my password?", top_k=3, threshold=0.0)
+        assert [d["id"] for d, _ in before] == [d["id"] for d, _ in after]
+
+    def test_analysis_reports_a_suggested_category(self, bundled_engine):
+        engine, _ = bundled_engine
+        analysis = engine.analyze_query("My payment was declined twice")
+        assert analysis["has_results"] is True
+        assert analysis["suggested_category"]
+        assert (analysis["min_similarity"] <= analysis["avg_similarity"]
+                <= analysis["max_similarity"])
+
+    def test_query_that_matches_nothing_is_filtered_by_the_threshold(self, bundled_engine):
+        engine, _ = bundled_engine
+        assert engine.retrieve("zzzz qqqq xxxx", top_k=5, threshold=0.99) == []
+
+    def test_uninitialised_engine_refuses_to_retrieve(self):
+        from src.rag_engine import RAGEngine
+        from src.vector_store import FAISSVectorStore
+        engine = RAGEngine(embedder=_HashingEmbedder(),
+                           vector_store=FAISSVectorStore(embedding_dimension=64))
+        with pytest.raises(RuntimeError, match="not initialized"):
+            engine.retrieve("anything")

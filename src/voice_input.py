@@ -49,7 +49,17 @@ def transcribe_audio(audio_bytes: bytes, language: str = "en-US") -> Optional[st
             pass
 
 
-def get_language_code_for_speech(lang_code: str) -> str:
+def get_language_code_for_speech(lang_code: Optional[str]) -> str:
+    """
+    Map an ISO 639-1 code to the BCP-47 tag the speech services expect.
+
+    A missing or blank code falls back to English rather than raising
+    (`None.upper()`) or producing the nonsense tag `"-"`.
+    """
+    if not lang_code or not str(lang_code).strip():
+        return "en-US"
+    lang_code = str(lang_code).strip().lower()
+
     mapping = {
         "en": "en-US", "hi": "hi-IN", "fr": "fr-FR", "de": "de-DE",
         "es": "es-ES", "pt": "pt-BR", "ar": "ar-SA", "zh-cn": "zh-CN",
@@ -58,4 +68,10 @@ def get_language_code_for_speech(lang_code: str) -> str:
         "te": "te-IN", "mr": "mr-IN", "gu": "gu-IN", "kn": "kn-IN",
         "ml": "ml-IN", "pa": "pa-IN",
     }
-    return mapping.get(lang_code, f"{lang_code}-{lang_code.upper()}")
+    if lang_code in mapping:
+        return mapping[lang_code]
+    # Already a BCP-47 tag such as "pt-br"? Normalise its region casing.
+    if "-" in lang_code:
+        base, region = lang_code.split("-", 1)
+        return f"{base}-{region.upper()}"
+    return f"{lang_code}-{lang_code.upper()}"
