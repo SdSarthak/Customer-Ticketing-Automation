@@ -32,19 +32,42 @@ class MongoDBClient:
         self._db = None
 
     def connect(self):
-        """Establish connection to MongoDB and ensure indexes exist."""
+        """
+        Establish connection to MongoDB and ensure indexes exist.
+
+        A MongoClient starts background monitor threads and sockets as soon as
+        it is constructed, so a failed handshake has to close it explicitly.
+        Dropping the reference instead leaked a monitor thread per attempt —
+        and `db` retries connect() on every property access, so a Mongo-less
+        deployment accumulated them for the life of the process.
+        """
+        client = None
         try:
-            self._client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
-            self._client.admin.command("ping")
-            self._db = self._client[self.db_name]
+            client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
+            client.admin.command("ping")
+            self._client = client
+            self._db = client[self.db_name]
             self._ensure_indexes()
             return True
-        except ConnectionFailure as e:
-            raise ConnectionError(
-                f"Cannot connect to MongoDB at {_redact_uri(self.uri)}. "
-                "Make sure MongoDB is running or check your MONGODB_URI. "
-                f"Error: {e}"
-            ) from e
+        except Exception as e:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            self._client = None
+            self._db = None
+            if isinstance(e, ConnectionFailure):
+                raise ConnectionError(
+                    f"Cannot connect to MongoDB at {_redact_uri(self.uri)}. "
+                    "Make sure MongoDB is running or check your MONGODB_URI. "
+                    f"Error: {e}"
+                ) from e
+            if isinstance(e, PyMongoError):
+                raise ConnectionError(
+                    f"MongoDB URI {_redact_uri(self.uri)} was rejected: {e}"
+                ) from e
+            raise
 
     def _ensure_indexes(self):
         """Create the indexes the ticket queries rely on (idempotent)."""

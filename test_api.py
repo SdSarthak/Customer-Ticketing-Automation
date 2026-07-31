@@ -273,6 +273,85 @@ class TestScreenshotUpload:
         assert r.status_code == 200
         assert r.json()["screenshot_saved"] is False
 
+    def test_bad_email_leaves_no_orphaned_upload(self, client, tmp_path, monkeypatch):
+        """A rejected request must not litter uploads/ with an unreferenced file."""
+        import api
+        upload_dir = tmp_path / "uploads"
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(upload_dir))
+        r = client.post(
+            "/tickets/with-screenshot",
+            data={**self.BASE, "user_email": "not-an-email"},
+            files={"screenshot": ("s.png", io.BytesIO(b"fakepng"), "image/png")},
+        )
+        assert r.status_code == 400
+        assert not upload_dir.exists() or list(upload_dir.iterdir()) == []
+
+    def test_pipeline_failure_removes_the_saved_upload(self, client, tmp_path, monkeypatch):
+        import api
+        upload_dir = tmp_path / "uploads"
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(upload_dir))
+        with patch.object(api.response_generator, "generate_response",
+                          side_effect=RuntimeError("llm exploded")):
+            with pytest.raises(RuntimeError):
+                self._post(client, "s.png")
+        assert list(upload_dir.iterdir()) == []
+
+    def test_empty_screenshot_file_is_not_kept(self, client, tmp_path, monkeypatch):
+        import api
+        upload_dir = tmp_path / "uploads"
+        monkeypatch.setattr(api, "UPLOAD_DIR", str(upload_dir))
+        r = self._post(client, "s.png", content=b"")
+        assert r.status_code == 200
+        assert r.json()["screenshot_saved"] is False
+        assert list(upload_dir.iterdir()) == []
+
+
+# ── INPUT LIMITS ──────────────────────────────────────────────────────────────
+
+class TestInputLimits:
+    def test_oversized_description_returns_400(self, client):
+        import api
+        body = {**VALID_TICKET, "issue_description": "x" * (api.MAX_ISSUE_CHARS + 1)}
+        r = client.post("/tickets", json=body)
+        assert r.status_code == 400
+        assert "too long" in r.json()["detail"]
+
+    def test_oversized_name_returns_400(self, client):
+        import api
+        body = {**VALID_TICKET, "user_name": "n" * (api.MAX_NAME_CHARS + 1)}
+        assert client.post("/tickets", json=body).status_code == 400
+
+    def test_blank_name_returns_400(self, client):
+        body = {**VALID_TICKET, "user_name": "   "}
+        assert client.post("/tickets", json=body).status_code == 400
+
+    def test_attempt_history_is_capped(self, client):
+        import api
+        body = {**VALID_TICKET, "attempt_history": [f"tried {i}" for i in range(100)]}
+        r = client.post("/tickets", json=body)
+        assert r.status_code == 200
+        saved = api.db.save_ticket.call_args[0][0]
+        assert len(saved["attempt_history"]) == api.MAX_ATTEMPTS
+
+    def test_blank_attempt_entries_are_dropped(self, client):
+        import api
+        body = {**VALID_TICKET, "attempt_history": ["restarted", "  ", ""]}
+        assert client.post("/tickets", json=body).status_code == 200
+        assert api.db.save_ticket.call_args[0][0]["attempt_history"] == ["restarted"]
+
+    def test_unicode_description_survives_round_trip(self, client):
+        import api
+        text = "मेरा ऑर्डर नहीं आया — 订单未到 — 🚚"
+        body = {**VALID_TICKET, "issue_description": text, "language": "en"}
+        assert client.post("/tickets", json=body).status_code == 200
+        assert api.db.save_ticket.call_args[0][0]["issue_description"] == text
+
+    def test_description_is_trimmed_before_storage(self, client):
+        import api
+        body = {**VALID_TICKET, "issue_description": "  padded issue  "}
+        assert client.post("/tickets", json=body).status_code == 200
+        assert api.db.save_ticket.call_args[0][0]["issue_description"] == "padded issue"
+
 
 # ── TRANSCRIBE ────────────────────────────────────────────────────────────────
 
@@ -284,12 +363,31 @@ class TestTranscribe:
                 data={"language": "en"})
         assert r.status_code == 200 and r.json()["text"] == "hello world"
 
-    def test_empty_returns_422(self, client):
-        with patch("api.transcribe_audio", return_value=None):
+    def test_empty_upload_returns_400(self, client):
+        """An empty body is rejected before the STT service is ever called."""
+        with patch("api.transcribe_audio", return_value=None) as stt:
             r = client.post("/transcribe",
                 files={"audio": ("s.webm", io.BytesIO(b""), "audio/webm")},
                 data={"language": "en"})
+        assert r.status_code == 400
+        stt.assert_not_called()
+
+    def test_unintelligible_audio_returns_422(self, client):
+        with patch("api.transcribe_audio", return_value=None):
+            r = client.post("/transcribe",
+                files={"audio": ("s.webm", io.BytesIO(b"\x1a\x45\xdf\xa3"), "audio/webm")},
+                data={"language": "en"})
         assert r.status_code == 422
+
+    def test_oversized_audio_returns_413(self, client):
+        import api as api_module
+        with patch.object(api_module, "MAX_AUDIO_BYTES", 1024), \
+             patch("api.transcribe_audio", return_value="hi") as stt:
+            r = client.post("/transcribe",
+                files={"audio": ("s.webm", io.BytesIO(b"0" * 5000), "audio/webm")},
+                data={"language": "en"})
+        assert r.status_code == 413
+        stt.assert_not_called()
 
     def test_service_down_returns_503(self, client):
         with patch("api.transcribe_audio", side_effect=RuntimeError("down")):

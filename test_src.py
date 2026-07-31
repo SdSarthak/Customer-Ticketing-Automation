@@ -367,6 +367,55 @@ class TestMongoClient:
         client._db["tickets"].update_one.return_value = result
         assert client.update_ticket_status("TKT-NOPE", "resolved") is False
 
+    def test_failed_connect_closes_the_client(self):
+        """A MongoClient starts monitor threads on construction; a failed
+        handshake must close it instead of leaking one per attempt."""
+        from pymongo.errors import ServerSelectionTimeoutError
+        import src.db as db_module
+
+        fake = MagicMock()
+        fake.admin.command.side_effect = ServerSelectionTimeoutError("no server")
+
+        client = db_module.MongoDBClient(uri="mongodb://nowhere:27017")
+        with patch.object(db_module, "MongoClient", return_value=fake):
+            with pytest.raises(ConnectionError):
+                client.connect()
+
+        fake.close.assert_called_once()
+        assert client._client is None and client._db is None
+
+    def test_failed_connect_does_not_leak_across_retries(self):
+        from pymongo.errors import ServerSelectionTimeoutError
+        import src.db as db_module
+
+        made = []
+
+        def _factory(*_a, **_k):
+            fake = MagicMock()
+            fake.admin.command.side_effect = ServerSelectionTimeoutError("no server")
+            made.append(fake)
+            return fake
+
+        client = db_module.MongoDBClient(uri="mongodb://nowhere:27017")
+        with patch.object(db_module, "MongoClient", side_effect=_factory):
+            for _ in range(3):
+                with pytest.raises(ConnectionError):
+                    client.connect()
+
+        assert len(made) == 3
+        assert all(m.close.called for m in made)
+
+    def test_bad_uri_is_reported_with_redacted_credentials(self):
+        from pymongo.errors import ConfigurationError
+        import src.db as db_module
+
+        client = db_module.MongoDBClient(uri="mongodb://user:secret@bad-host/db")
+        with patch.object(db_module, "MongoClient",
+                          side_effect=ConfigurationError("bad uri")):
+            with pytest.raises(ConnectionError) as exc:
+                client.connect()
+        assert "secret" not in str(exc.value)
+
 
 # ── VECTOR STORE ──────────────────────────────────────────────────────────────
 

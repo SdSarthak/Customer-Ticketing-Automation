@@ -65,6 +65,10 @@ def _startup_sync():
         print("MongoDB connected")
     except Exception as e:
         print(f"WARNING: MongoDB not available — {e}")
+        try:
+            db.close()
+        except Exception:
+            pass
         db = None
 
     # Email
@@ -144,8 +148,49 @@ app.add_middleware(
 
 UPLOAD_DIR = "uploads"
 MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_AUDIO_BYTES = 15 * 1024 * 1024      # 15 MB — well over a minute of webm/opus
 ALLOWED_SCREENSHOT_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+# Free-text limits. Without them a single request can push an arbitrary amount
+# of text through the LLM, the translator and into MongoDB.
+MAX_NAME_CHARS = 200
+MAX_ISSUE_CHARS = 20_000
+MAX_ATTEMPTS = 20
+MAX_ATTEMPT_CHARS = 2_000
+
+
+async def _read_upload_limited(upload: UploadFile, max_bytes: int, label: str) -> bytes:
+    """
+    Read an upload into memory, refusing anything over `max_bytes`.
+
+    `await upload.read()` with no argument buffers the entire body first, so a
+    single large POST could exhaust the process before any check ran. Reading in
+    chunks lets the limit be enforced before the memory is committed.
+    """
+    chunks: List[bytes] = []
+    total = 0
+    while chunk := await upload.read(64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                413,
+                f"{label} exceeds the {max_bytes // (1024 * 1024)} MB limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _clean_text(value: Optional[str], field: str, max_chars: int, required: bool) -> str:
+    """Trim a free-text field and enforce a length bound, or 400."""
+    text = (value or "").strip()
+    if required and not text:
+        raise HTTPException(400, f"{field} must not be empty")
+    if len(text) > max_chars:
+        raise HTTPException(
+            400, f"{field} is too long ({len(text)} chars, max {max_chars})"
+        )
+    return text
 
 
 def _require_generator():
@@ -176,13 +221,27 @@ def _validate_email(email: str) -> str:
     return email
 
 
-def _save_screenshot(screenshot: UploadFile) -> Optional[str]:
+def _discard_upload(path: Optional[str]) -> None:
+    """Delete a half-finished upload, ignoring a file that is already gone."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+async def _save_screenshot(screenshot: UploadFile) -> Optional[str]:
     """
     Persist an uploaded screenshot under uploads/ and return its path.
 
     The client-supplied filename is never trusted: it is reduced to a safe
     extension and given a random stem, so a name like '../../src/config.py'
     cannot escape the upload directory or overwrite project files.
+
+    Reads are chunked and awaited so a 5 MB upload neither lands in memory in
+    one piece nor blocks the event loop, and an over-limit upload is removed
+    before it is fully written.
     """
     if not screenshot or not screenshot.filename:
         return None
@@ -196,21 +255,28 @@ def _save_screenshot(screenshot: UploadFile) -> Optional[str]:
         )
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex}{ext}"
-    path = os.path.join(UPLOAD_DIR, safe_name)
+    path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}{ext}")
 
     written = 0
-    with open(path, "wb") as f:
-        while chunk := screenshot.file.read(64 * 1024):
-            written += len(chunk)
-            if written > MAX_SCREENSHOT_BYTES:
-                f.close()
-                os.remove(path)
-                raise HTTPException(
-                    413,
-                    f"Screenshot exceeds the {MAX_SCREENSHOT_BYTES // (1024 * 1024)} MB limit",
-                )
-            f.write(chunk)
+    try:
+        with open(path, "wb") as f:
+            while chunk := await screenshot.read(64 * 1024):
+                written += len(chunk)
+                if written > MAX_SCREENSHOT_BYTES:
+                    raise HTTPException(
+                        413,
+                        f"Screenshot exceeds the "
+                        f"{MAX_SCREENSHOT_BYTES // (1024 * 1024)} MB limit",
+                    )
+                f.write(chunk)
+    except BaseException:
+        # Never leave a partial or rejected upload behind on disk.
+        _discard_upload(path)
+        raise
+
+    if written == 0:
+        _discard_upload(path)
+        return None
 
     return path
 
@@ -233,10 +299,17 @@ def _build_ticket(
     """
     generator = _require_generator()
 
-    if not issue_description or not issue_description.strip():
-        raise HTTPException(400, "issue_description must not be empty")
-
+    issue_description = _clean_text(
+        issue_description, "issue_description", MAX_ISSUE_CHARS, required=True
+    )
+    user_name = _clean_text(user_name, "user_name", MAX_NAME_CHARS, required=True)
     user_email = _validate_email(user_email)
+
+    attempt_history = [
+        _clean_text(a, "attempt_history entry", MAX_ATTEMPT_CHARS, required=False)
+        for a in (attempt_history or [])[:MAX_ATTEMPTS]
+    ]
+    attempt_history = [a for a in attempt_history if a]
 
     lang = language or detect_language(issue_description)
     english_issue = (
@@ -266,7 +339,7 @@ def _build_ticket(
         "summary": categorization.get("summary", ""),
         "ai_response": ai_response,
         "screenshot_path": screenshot_path,
-        "attempt_history": attempt_history or [],
+        "attempt_history": attempt_history,
         "language": lang,
     }
 
@@ -448,7 +521,11 @@ async def create_ticket_with_screenshot(
     screenshot: Optional[UploadFile] = File(None),
 ):
     """Create a ticket with optional screenshot attachment."""
-    screenshot_path = _save_screenshot(screenshot)
+    # Validate the cheap fields before touching the disk, so a bad email does
+    # not leave an orphaned file in uploads/ on every rejected request.
+    _clean_text(issue_description, "issue_description", MAX_ISSUE_CHARS, required=True)
+    _clean_text(user_name, "user_name", MAX_NAME_CHARS, required=True)
+    _validate_email(user_email)
 
     try:
         history = _json.loads(attempt_history or "[]")
@@ -456,17 +533,24 @@ async def create_ticket_with_screenshot(
             history = []
     except (ValueError, TypeError):
         history = []
+    history = [str(item) for item in history]
 
-    ticket_id, ticket_data, ai_response_en = _build_ticket(
-        user_name=user_name,
-        user_email=user_email,
-        issue_description=issue_description,
-        category=category,
-        priority=priority,
-        language=language,
-        attempt_history=history,
-        screenshot_path=screenshot_path,
-    )
+    screenshot_path = await _save_screenshot(screenshot)
+
+    try:
+        ticket_id, ticket_data, ai_response_en = _build_ticket(
+            user_name=user_name,
+            user_email=user_email,
+            issue_description=issue_description,
+            category=category,
+            priority=priority,
+            language=language,
+            attempt_history=history,
+            screenshot_path=screenshot_path,
+        )
+    except BaseException:
+        _discard_upload(screenshot_path)
+        raise
 
     background.add_task(
         _send_emails, ticket_id, ticket_data, ai_response_en, screenshot_path
@@ -528,7 +612,9 @@ async def transcribe_voice(
     Transcribe audio to text.
     Frontend sends field 'audio', reads d.text from response.
     """
-    audio_bytes = await audio.read()
+    audio_bytes = await _read_upload_limited(audio, MAX_AUDIO_BYTES, "Audio upload")
+    if not audio_bytes:
+        raise HTTPException(400, "No audio was uploaded")
     speech_lang = get_language_code_for_speech(language or "en")
     try:
         text = transcribe_audio(audio_bytes, language=speech_lang)
@@ -648,7 +734,9 @@ async def voice_chat(
     _require_rag()
     generator = _require_generator()
 
-    audio_bytes = await audio.read()
+    audio_bytes = await _read_upload_limited(audio, MAX_AUDIO_BYTES, "Audio upload")
+    if not audio_bytes:
+        raise HTTPException(400, "No audio was uploaded")
     lang = language or "en"
     speech_lang = get_language_code_for_speech(lang)
 
