@@ -4,6 +4,7 @@ All external services (Groq, MongoDB, pyttsx3) are mocked so tests run offline.
 """
 
 import io
+import time
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
@@ -541,6 +542,113 @@ class TestTTS:
         from api import _text_to_mp3
         with pytest.raises(RuntimeError):
             await _text_to_mp3("   ", "en")
+
+    def test_concurrent_synthesis_is_serialised(self, tmp_path):
+        """pyttsx3.init() returns a shared engine — overlapping runAndWait()
+        calls raise 'run loop already started' and corrupt each other's file."""
+        import os
+        import threading
+        import api as api_module
+
+        overlaps = []
+        active = []
+        active_lock = threading.Lock()
+
+        made = []
+
+        def _run_and_wait():
+            with active_lock:
+                active.append(1)
+                if len(active) > 1:
+                    overlaps.append(len(active))
+            time.sleep(0.05)
+            with active_lock:
+                active.pop()
+
+        engine = MagicMock()
+        engine.runAndWait.side_effect = _run_and_wait
+        engine.getProperty.side_effect = lambda k: ([_voice("en-US")] if k == "voices" else 160)
+
+        def _mkstemp(**_kw):
+            # Each call gets its own scratch wav, as the real mkstemp would
+            with active_lock:
+                made.append(1)
+                path = tmp_path / f"out{len(made)}.wav"
+            path.write_bytes(b"RIFF" + b"\x00" * 100)
+            fd = os.open(str(tmp_path / f"handle{len(made)}.bin"), os.O_CREAT | os.O_RDWR)
+            return fd, str(path)
+
+        errors = []
+
+        def _worker():
+            try:
+                api_module._synthesize_wav("hello", "en")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        with patch("pyttsx3.init", return_value=engine), \
+             patch("api.tempfile.mkstemp", side_effect=_mkstemp):
+            threads = [threading.Thread(target=_worker) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+
+        assert errors == []
+        assert overlaps == [], f"{len(overlaps)} overlapping synthesis calls"
+        assert engine.runAndWait.call_count == 4
+
+
+# ── STEP PARSING ──────────────────────────────────────────────────────────────
+
+class TestStepParsing:
+    def test_numbered_steps_are_split_out(self):
+        from api import _parse_steps
+        intro, steps = _parse_steps(
+            "Here is what to try:\n1. Restart the app\n2. Clear the cache"
+        )
+        assert intro == "Here is what to try:"
+        assert steps == ["Restart the app", "Clear the cache"]
+
+    def test_digits_inside_a_step_are_not_eaten(self):
+        """lstrip('0123456789.-) ') chewed through the step's own content."""
+        from api import _parse_steps
+        _, steps = _parse_steps("1. 2-factor auth is off — turn it on")
+        assert steps == ["2-factor auth is off — turn it on"]
+
+    def test_leading_number_in_step_text_survives(self):
+        from api import _parse_steps
+        _, steps = _parse_steps("3) 30 seconds later, retry the payment")
+        assert steps == ["30 seconds later, retry the payment"]
+
+    def test_bullets_count_as_steps(self):
+        from api import _parse_steps
+        _, steps = _parse_steps("- Check your wifi\n* Reboot the router\n• Call us")
+        assert steps == ["Check your wifi", "Reboot the router", "Call us"]
+
+    def test_bold_wrapped_numbering_is_handled(self):
+        from api import _parse_steps
+        _, steps = _parse_steps("**1.** Open settings")
+        assert steps == ["Open settings"]
+
+    def test_prose_without_markers_is_all_intro(self):
+        from api import _parse_steps
+        intro, steps = _parse_steps("Just contact support directly.")
+        assert steps == [] and intro == "Just contact support directly."
+
+    def test_blank_input_yields_nothing(self):
+        from api import _parse_steps
+        assert _parse_steps("") == ("", [])
+        assert _parse_steps("\n\n  \n") == ("", [])
+
+    def test_self_help_endpoint_keeps_step_content(self, client):
+        import api
+        with patch.object(api.response_generator, "generate_self_help",
+                          return_value="Try these:\n1. 2FA is disabled - enable it\n2. Retry"):
+            r = client.post("/self-help", json={"issue": "I cannot sign in at all"})
+        assert r.status_code == 200
+        assert r.json()["steps"] == ["2FA is disabled - enable it", "Retry"]
+        assert r.json()["response"] == "Try these:"
 
 
 class TestVoiceSelection:

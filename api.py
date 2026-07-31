@@ -12,7 +12,8 @@ import json as _json
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional, List
+import threading
+from typing import Optional, List, Tuple
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -179,6 +180,36 @@ async def _read_upload_limited(upload: UploadFile, max_bytes: int, label: str) -
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# Leading list marker on a line of LLM output: "1.", "2)", "- ", "* ", "•",
+# optionally wrapped in markdown bold.
+_STEP_PREFIX = re.compile(r"^\s*(?:\*\*)?\s*(?:\d+\s*[.)\]]|[-*•])\s*(?:\*\*)?\s+")
+
+
+def _parse_steps(text: str) -> Tuple[str, List[str]]:
+    """
+    Split self-help output into an intro paragraph and a list of steps.
+
+    Shared by /self-help and /voice-chat, which previously each stripped list
+    markers with `line.lstrip("0123456789.-) ")`. lstrip removes *every* leading
+    character in that set, so "1. 2-factor auth is off" lost its "2-" and became
+    "factor auth is off". Matching an explicit prefix removes only the marker.
+    """
+    steps: List[str] = []
+    intro: List[str] = []
+    for raw in (text or "").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        match = _STEP_PREFIX.match(line)
+        if match:
+            body = line[match.end():].strip()
+            if body:
+                steps.append(body)
+        else:
+            intro.append(line)
+    return " ".join(intro), steps
 
 
 def _clean_text(value: Optional[str], field: str, max_chars: int, required: bool) -> str:
@@ -435,19 +466,8 @@ def self_help(req: SelfHelpRequest):
     steps_text = translate_from_english(steps_en, lang) if lang != "en" else steps_en
 
     # Parse numbered steps into a list for the frontend's step-list rendering
-    lines = [l.strip() for l in steps_text.split("\n") if l.strip()]
-    steps = []
-    intro_lines = []
-    for line in lines:
-        # Strip leading "1." "2." "3." etc.
-        stripped = line.lstrip("0123456789.-) ").strip()
-        if stripped:
-            if line[0].isdigit():
-                steps.append(stripped)
-            else:
-                intro_lines.append(stripped)
-
-    response_text = " ".join(intro_lines) if intro_lines else "Here are some steps to try:"
+    intro, steps = _parse_steps(steps_text)
+    response_text = intro or "Here are some steps to try:"
     if not steps:
         # No numbered steps found — return whole text as single step
         steps = [steps_text]
@@ -667,9 +687,20 @@ def _pick_voice(voices, lang: str):
     return voices[1] if len(voices) > 1 else voices[0]
 
 
+# pyttsx3.init() hands back a *shared*, cached engine per driver. Two
+# concurrent /voice-chat requests therefore drive the same engine: the second
+# runAndWait() raises "run loop already started" and the two save_to_file calls
+# race over each other's output. Synthesis is serialised instead.
+_TTS_LOCK = threading.Lock()
+TTS_LOCK_TIMEOUT = 60.0
+
+
 def _synthesize_wav(text: str, lang: str) -> bytes:
     """Blocking pyttsx3 synthesis. Runs in a worker thread, never inline."""
     import pyttsx3
+
+    if not _TTS_LOCK.acquire(timeout=TTS_LOCK_TIMEOUT):
+        raise RuntimeError("TTS engine is busy — try again in a moment")
 
     fd, tmp_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
@@ -693,6 +724,7 @@ def _synthesize_wav(text: str, lang: str) -> bytes:
     except Exception as e:
         raise RuntimeError(f"pyttsx3 TTS failed: {e}") from e
     finally:
+        _TTS_LOCK.release()
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -756,8 +788,9 @@ async def voice_chat(
     reply_text = translate_from_english(steps_en, detected_lang) if detected_lang != "en" else steps_en
 
     # Flatten numbered steps into prose for TTS (numbers sound odd spoken)
-    lines = [l.strip().lstrip("0123456789.-) ").strip() for l in reply_text.split("\n") if l.strip()]
-    tts_text = " ".join(lines) if lines else reply_text
+    intro, steps = _parse_steps(reply_text)
+    spoken = [part for part in ([intro] + steps) if part]
+    tts_text = " ".join(spoken) if spoken else reply_text
 
     # Step 3 — TTS
     try:
@@ -784,12 +817,19 @@ async def voice_chat(
 # ─── Ticket queries ───────────────────────────────────────────────────────────
 
 @app.get("/tickets")
-def get_all_tickets():
-    """Return all tickets for admin view."""
+def get_all_tickets(limit: int = 200, skip: int = 0):
+    """
+    Return the most recent tickets for the admin view.
+
+    Paged rather than unbounded — the previous version serialised the entire
+    collection into a single response.
+    """
+    if limit < 1 or skip < 0:
+        raise HTTPException(400, "limit must be >= 1 and skip must be >= 0")
     if not db:
         return []
     try:
-        return db.get_all_tickets()
+        return db.get_all_tickets(limit=limit, skip=skip)
     except Exception as e:
         print(f"WARNING: could not list tickets — {e}")
         return []
@@ -811,13 +851,16 @@ def get_ticket_stats():
 
 
 @app.get("/tickets/by-email/{email}")
-def get_tickets_by_email(email: str):
-    """Return all tickets for a customer email."""
+def get_tickets_by_email(email: str, limit: int = 200):
+    """Return a customer's most recent tickets."""
+    if limit < 1:
+        raise HTTPException(400, "limit must be >= 1")
     if not db:
         return []
     try:
-        return db.get_tickets_by_email(email)
-    except Exception:
+        return db.get_tickets_by_email(email, limit=limit)
+    except Exception as e:
+        print(f"WARNING: could not list tickets for {email} — {e}")
         return []
 
 

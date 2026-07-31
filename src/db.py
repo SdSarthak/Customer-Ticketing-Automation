@@ -16,6 +16,23 @@ def _redact_uri(uri: str) -> str:
     return re.sub(r"://[^/@]+@", "://<credentials>@", uri or "")
 
 
+# Listing endpoints are paged. Without a cap a single request loads every
+# ticket ever filed into memory and serialises it into one JSON response.
+DEFAULT_PAGE_SIZE = 200
+MAX_PAGE_SIZE = 1000
+
+
+def _page_size(limit) -> int:
+    """Clamp a caller-supplied page size into a sane range."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    if limit < 1:
+        return DEFAULT_PAGE_SIZE
+    return min(limit, MAX_PAGE_SIZE)
+
+
 def _utcnow() -> datetime.datetime:
     """Timezone-aware UTC now (datetime.utcnow() is deprecated)."""
     return datetime.datetime.now(datetime.timezone.utc)
@@ -153,18 +170,29 @@ class MongoDBClient:
         doc = self.db["tickets"].find_one({"ticket_id": ticket_id}, {"_id": 0})
         return doc
 
-    def get_tickets_by_email(self, email: str) -> List[Dict]:
-        """Get all tickets for a user email"""
+    def get_tickets_by_email(self, email: str, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]:
+        """Get a customer's most recent tickets, newest first."""
         return list(
             self.db["tickets"]
             .find({"user_email": email}, {"_id": 0})
             .sort("created_at", DESCENDING)
+            .limit(_page_size(limit))
         )
 
-    def get_all_tickets(self) -> List[Dict]:
-        """Get all tickets (admin view)"""
+    def get_all_tickets(self, limit: int = DEFAULT_PAGE_SIZE, skip: int = 0) -> List[Dict]:
+        """
+        Get the most recent tickets (admin view).
+
+        Bounded by default: an unlimited find() materialises the whole
+        collection into a list and ships it to the browser in one response,
+        which stops working long before the database does.
+        """
         return list(
-            self.db["tickets"].find({}, {"_id": 0}).sort("created_at", DESCENDING)
+            self.db["tickets"]
+            .find({}, {"_id": 0})
+            .sort("created_at", DESCENDING)
+            .skip(max(int(skip), 0))
+            .limit(_page_size(limit))
         )
 
     def update_ticket_status(self, ticket_id: str, status: str) -> bool:
@@ -239,9 +267,12 @@ class MongoDBClient:
         result = self.db["feedback"].insert_one(doc)
         return str(result.inserted_id)
 
-    def get_all_feedback(self) -> List[Dict]:
+    def get_all_feedback(self, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]:
         return list(
-            self.db["feedback"].find({}, {"_id": 0}).sort("created_at", DESCENDING)
+            self.db["feedback"]
+            .find({}, {"_id": 0})
+            .sort("created_at", DESCENDING)
+            .limit(_page_size(limit))
         )
 
     def close(self):

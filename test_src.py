@@ -480,6 +480,42 @@ class TestMongoClient:
         assert len(made) == 3
         assert all(m.close.called for m in made)
 
+    def test_listings_are_bounded_by_default(self):
+        from src.db import DEFAULT_PAGE_SIZE
+        client = self._client()
+        client.get_all_tickets()
+        cursor = client._db["tickets"].find.return_value.sort.return_value
+        cursor.skip.assert_called_once_with(0)
+        cursor.skip.return_value.limit.assert_called_once_with(DEFAULT_PAGE_SIZE)
+
+    def test_listing_limit_is_clamped_to_the_maximum(self):
+        from src.db import MAX_PAGE_SIZE
+        client = self._client()
+        client.get_all_tickets(limit=10 ** 9)
+        cursor = client._db["tickets"].find.return_value.sort.return_value
+        cursor.skip.return_value.limit.assert_called_once_with(MAX_PAGE_SIZE)
+
+    def test_nonsense_limit_falls_back_to_the_default(self):
+        from src.db import _page_size, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+        assert _page_size(0) == DEFAULT_PAGE_SIZE
+        assert _page_size(-5) == DEFAULT_PAGE_SIZE
+        assert _page_size("abc") == DEFAULT_PAGE_SIZE
+        assert _page_size(None) == DEFAULT_PAGE_SIZE
+        assert _page_size(50) == 50
+        assert _page_size(MAX_PAGE_SIZE + 1) == MAX_PAGE_SIZE
+
+    def test_negative_skip_is_floored_at_zero(self):
+        client = self._client()
+        client.get_all_tickets(skip=-10)
+        cursor = client._db["tickets"].find.return_value.sort.return_value
+        cursor.skip.assert_called_once_with(0)
+
+    def test_by_email_listing_is_bounded(self):
+        client = self._client()
+        client.get_tickets_by_email("a@b.com", limit=7)
+        cursor = client._db["tickets"].find.return_value.sort.return_value
+        cursor.limit.assert_called_once_with(7)
+
     def test_bad_uri_is_reported_with_redacted_credentials(self):
         from pymongo.errors import ConfigurationError
         import src.db as db_module
