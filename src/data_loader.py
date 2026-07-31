@@ -9,6 +9,25 @@ from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 
 
+def _text(value) -> str:
+    """
+    Coerce a cell to clean text.
+
+    `str(value or "")` looked equivalent but turned a float NaN into the literal
+    string "nan" (NaN is truthy) and a numeric 0 into "", so malformed rows were
+    embedded as the word "nan" and indexed as if they were real content.
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        # Arrays and other non-scalars: fall through to str()
+        pass
+    return str(value).strip()
+
+
 class DataLoader:
     """Class to handle data loading and preprocessing for customer support tickets"""
     
@@ -32,8 +51,27 @@ class DataLoader:
         """
         if not os.path.exists(self.data_path):
             raise FileNotFoundError(f"Data file not found: {self.data_path}")
-        
-        self.data = pd.read_csv(self.data_path)
+        if not os.path.isfile(self.data_path):
+            raise ValueError(f"Data path is not a file: {self.data_path}")
+
+        try:
+            self.data = pd.read_csv(self.data_path)
+        except pd.errors.EmptyDataError as e:
+            raise ValueError(f"Data file is empty: {self.data_path}") from e
+        except pd.errors.ParserError as e:
+            raise ValueError(
+                f"Data file {self.data_path} is not valid CSV: {e}"
+            ) from e
+        except UnicodeDecodeError:
+            # Exported spreadsheets are frequently latin-1/cp1252 rather than UTF-8
+            self.data = pd.read_csv(self.data_path, encoding="latin-1")
+
+        if self.data.empty:
+            raise ValueError(
+                f"Data file {self.data_path} has a header but no rows — "
+                "nothing can be indexed from it."
+            )
+
         print(f"✅ Loaded {len(self.data)} records from {self.data_path}")
         return self.data
     
@@ -57,10 +95,12 @@ class DataLoader:
         # Handle missing values
         df = df.fillna("")
         
-        # Clean text columns
+        # Clean text columns. astype(str) first: a mixed-type object column
+        # (numbers alongside text) makes .str.strip() return NaN for every
+        # non-string cell, silently re-introducing the nulls fillna just removed.
         text_columns = df.select_dtypes(include=['object']).columns
         for col in text_columns:
-            df[col] = df[col].str.strip()
+            df[col] = df[col].astype(str).str.strip()
             df[col] = df[col].str.replace(r'\s+', ' ', regex=True)
         
         self.processed_data = df
@@ -99,20 +139,37 @@ class DataLoader:
         has_category = bool(category_col) and category_col in df.columns
 
         documents = []
+        blank_rows = 0
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Creating documents"):
-            instruction = str(row[instruction_col] or "")
-            response = str(row[response_col] or "")
-            category = str(row[category_col] or "General") if has_category else "General"
-            doc = {
+            instruction = _text(row[instruction_col])
+            response = _text(row[response_col])
+
+            # A row with neither a question nor an answer still produced a
+            # document whose text was just the two template labels. That costs
+            # an embedding API call and then sits in the index as a document
+            # every query can weakly match. Drop it instead.
+            if not instruction and not response:
+                blank_rows += 1
+                continue
+
+            category = (_text(row[category_col]) or "General") if has_category else "General"
+            documents.append({
                 "id": str(idx),
                 "instruction": instruction,
                 "response": response,
                 "category": category,
-                "combined_text": f"Customer Query: {instruction}\nSupport Response: {response}"
-            }
-            documents.append(doc)
+                "combined_text": f"Customer Query: {instruction}\nSupport Response: {response}",
+            })
+
+        if not documents:
+            raise ValueError(
+                f"No usable rows in {self.data_path}: every row had an empty "
+                f"'{instruction_col}' and '{response_col}'."
+            )
 
         print(f"✅ Created {len(documents)} documents for embedding")
+        if blank_rows:
+            print(f"ℹ️ Skipped {blank_rows} row(s) with no query and no response")
         if not has_category:
             print(f"ℹ️ No '{category_col}' column found — all documents tagged 'General'")
         return documents

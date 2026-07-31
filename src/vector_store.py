@@ -61,13 +61,27 @@ class FAISSVectorStore:
 
         # Continue numbering from what is already indexed so a second
         # add_documents() call appends instead of shadowing earlier entries.
-        next_id = max(self.id_to_doc, default=-1) + 1
+        # An index restored from disk with unreadable metadata still holds
+        # vectors, so start past its highest possible id too.
+        next_id = max(max(self.id_to_doc, default=-1) + 1, self.index.ntotal)
 
         for offset, doc in enumerate(documents):
             if "embedding" not in doc:
                 raise ValueError(f"Document {offset} missing 'embedding' field")
 
-            embedding = np.asarray(doc["embedding"], dtype=np.float32)
+            try:
+                embedding = np.asarray(doc["embedding"], dtype=np.float32).ravel()
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"Document {offset} has a non-numeric 'embedding': {e}"
+                ) from e
+
+            if embedding.size != self.embedding_dimension:
+                raise ValueError(
+                    f"Document {offset} has a {embedding.size}-dimensional embedding "
+                    f"but the index expects {self.embedding_dimension}. "
+                    "The index was probably built with a different embedding model."
+                )
 
             # Normalize for cosine similarity
             norm = np.linalg.norm(embedding)
@@ -123,6 +137,18 @@ class FAISSVectorStore:
             print("⚠️ Vector store is empty")
             return []
 
+        if top_k is None or top_k < 1:
+            # faiss raises an opaque C++ assertion for k <= 0
+            raise ValueError(f"top_k must be at least 1, got {top_k!r}")
+
+        query_embedding = np.asarray(query_embedding, dtype=np.float32).ravel()
+        if query_embedding.size != self.index.d:
+            raise ValueError(
+                f"Query embedding has {query_embedding.size} dimensions but the "
+                f"index has {self.index.d}. Rebuild the index with the same "
+                "embedding model the queries use."
+            )
+
         # Normalize query embedding
         norm = np.linalg.norm(query_embedding)
         if norm == 0:
@@ -159,13 +185,19 @@ class FAISSVectorStore:
         Args:
             path: Directory path to save the store
         """
+        if self.index is None:
+            raise RuntimeError(
+                "Nothing to save: no index has been created. Call create_index() "
+                "and add_documents() first."
+            )
+
         path = path or Config.VECTOR_STORE_PATH
         os.makedirs(path, exist_ok=True)
-        
+
         # Save FAISS index
         index_path = os.path.join(path, "faiss_index.bin")
         faiss.write_index(self.index, index_path)
-        
+
         # Save documents and mappings
         metadata_path = os.path.join(path, "metadata.pkl")
         metadata = {
@@ -192,17 +224,53 @@ class FAISSVectorStore:
         if not os.path.exists(index_path):
             raise FileNotFoundError(f"Index file not found: {index_path}")
         
-        self.index = faiss.read_index(index_path)
-        
-        # Load documents and mappings
         metadata_path = os.path.join(path, "metadata.pkl")
-        with open(metadata_path, "rb") as f:
-            metadata = pickle.load(f)
-        
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(
+                f"Index metadata not found: {metadata_path}. The index is "
+                "unusable without it — rebuild with `python main.py --setup "
+                "--force-rebuild`."
+            )
+
+        index = faiss.read_index(index_path)
+
+        # Load documents and mappings
+        try:
+            with open(metadata_path, "rb") as f:
+                metadata = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError, AttributeError, ImportError) as e:
+            raise ValueError(
+                f"Index metadata at {metadata_path} is corrupt or was written by "
+                f"an incompatible version ({e}). Rebuild with "
+                "`python main.py --setup --force-rebuild`."
+            ) from e
+
+        missing = [
+            key
+            for key in ("documents", "id_to_doc", "embedding_dimension")
+            if key not in metadata
+        ]
+        if missing:
+            raise ValueError(
+                f"Index metadata at {metadata_path} is missing {', '.join(missing)}. "
+                "Rebuild with `python main.py --setup --force-rebuild`."
+            )
+
+        # A dimension mismatch here would otherwise surface much later as an
+        # opaque faiss assertion on the first query.
+        if metadata["embedding_dimension"] != index.d:
+            raise ValueError(
+                f"Index at {index_path} has dimension {index.d} but its metadata "
+                f"records {metadata['embedding_dimension']}. The two files are "
+                "from different builds — rebuild with "
+                "`python main.py --setup --force-rebuild`."
+            )
+
+        self.index = index
         self.documents = metadata["documents"]
         self.id_to_doc = metadata["id_to_doc"]
         self.embedding_dimension = metadata["embedding_dimension"]
-        
+
         print(f"✅ Vector store loaded from {path}")
         print(f"📊 Total documents: {self.index.ntotal}")
         

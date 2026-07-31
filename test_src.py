@@ -92,6 +92,81 @@ class TestDataLoader:
         train, test = loader.split_data(test_size=0.2)
         assert (len(train), len(test)) == (8, 2)
 
+    # ── malformed and edge-case input ─────────────────────────────────────────
+
+    def test_empty_file_raises_a_clear_error(self, tmp_path):
+        loader = DataLoader(_write_csv(tmp_path, ""))
+        with pytest.raises(ValueError, match="empty"):
+            loader.load_data()
+
+    def test_header_only_file_raises(self, tmp_path):
+        loader = DataLoader(_write_csv(tmp_path, "instruction,response\n"))
+        with pytest.raises(ValueError, match="no rows"):
+            loader.load_data()
+
+    def test_directory_path_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="not a file"):
+            DataLoader(str(tmp_path)).load_data()
+
+    def test_latin1_encoded_file_is_still_readable(self, tmp_path):
+        path = tmp_path / "latin1.csv"
+        path.write_bytes(
+            "instruction,response\nCafé closed?,Oui bien sûr\n".encode("latin-1")
+        )
+        loader = DataLoader(str(path))
+        assert len(loader.load_data()) == 1
+
+    def test_missing_cells_do_not_become_the_string_nan(self, tmp_path):
+        """`str(value or "")` turned a NaN cell into the literal text 'nan'."""
+        csv = "instruction,response,category\nWhere is my order?,,Shipping\n"
+        loader = DataLoader(_write_csv(tmp_path, csv))
+        loader.load_data()
+        doc = loader.create_documents()[0]
+        assert doc["response"] == ""
+        assert "nan" not in doc["combined_text"].lower()
+
+    def test_numeric_cells_in_a_text_column_survive_preprocessing(self, tmp_path):
+        # A mixed-type object column made .str.strip() return NaN for the number
+        csv = "instruction,response\n12345,Call us back\nWhy?,67890\n"
+        loader = DataLoader(_write_csv(tmp_path, csv))
+        loader.load_data()
+        docs = loader.create_documents()
+        assert docs[0]["instruction"] == "12345"
+        assert docs[1]["response"] == "67890"
+
+    def test_rows_with_no_content_are_dropped(self, tmp_path):
+        csv = (
+            "instruction,response\n"
+            "Real question?,Real answer\n"
+            ",\n"
+            "  ,  \n"
+        )
+        loader = DataLoader(_write_csv(tmp_path, csv))
+        loader.load_data()
+        docs = loader.create_documents()
+        assert len(docs) == 1
+        assert docs[0]["instruction"] == "Real question?"
+
+    def test_file_of_only_blank_rows_raises(self, tmp_path):
+        loader = DataLoader(_write_csv(tmp_path, "instruction,response\n,\n,\n"))
+        loader.load_data()
+        with pytest.raises(ValueError, match="No usable rows"):
+            loader.create_documents()
+
+    def test_blank_category_cell_falls_back_to_general(self, tmp_path):
+        csv = "instruction,response,category\nQ?,A,\n"
+        loader = DataLoader(_write_csv(tmp_path, csv))
+        loader.load_data()
+        assert loader.create_documents()[0]["category"] == "General"
+
+    def test_unicode_content_is_preserved(self, tmp_path):
+        csv = "instruction,response\nमेरा ऑर्डर कहाँ है?,आपका ऑर्डर रास्ते में है\n"
+        loader = DataLoader(_write_csv(tmp_path, csv))
+        loader.load_data()
+        doc = loader.create_documents()[0]
+        assert doc["instruction"] == "मेरा ऑर्डर कहाँ है?"
+        assert "आपका ऑर्डर रास्ते में है" in doc["combined_text"]
+
 
 # ── CATEGORIZATION ────────────────────────────────────────────────────────────
 
@@ -533,6 +608,98 @@ class TestVectorStore:
             for i in range(3)
         ])
         assert store.get_stats()["total_documents"] == 0
+
+    # ── dimension and argument validation ─────────────────────────────────────
+
+    def test_wrong_dimension_document_is_rejected(self):
+        import numpy as np
+        store = _store(0)
+        with pytest.raises(ValueError, match="dimensional embedding"):
+            store.add_documents([{"id": "x", "embedding": np.ones(DIM + 5, "float32")}])
+
+    def test_wrong_dimension_query_is_rejected(self):
+        """faiss otherwise aborts with an opaque C++ assertion."""
+        import numpy as np
+        store = _store(3)
+        with pytest.raises(ValueError, match="dimensions but the"):
+            store.search(np.ones(DIM + 5, dtype="float32"), top_k=1)
+
+    def test_non_numeric_embedding_is_rejected(self):
+        store = _store(0)
+        with pytest.raises(ValueError, match="non-numeric"):
+            store.add_documents([{"id": "x", "embedding": ["a", "b", "c"]}])
+
+    def test_non_positive_top_k_is_rejected(self):
+        import numpy as np
+        store = _store(3)
+        for bad in (0, -1, None):
+            with pytest.raises(ValueError, match="top_k"):
+                store.search(np.ones(DIM, dtype="float32"), top_k=bad)
+
+    def test_saving_without_an_index_raises_a_clear_error(self, tmp_path):
+        from src.vector_store import FAISSVectorStore
+        store = FAISSVectorStore(embedding_dimension=DIM)
+        with pytest.raises(RuntimeError, match="Nothing to save"):
+            store.save(str(tmp_path))
+
+    def test_load_without_metadata_raises(self, tmp_path):
+        store = _store(3)
+        store.save(str(tmp_path))
+        (tmp_path / "metadata.pkl").unlink()
+
+        from src.vector_store import FAISSVectorStore
+        with pytest.raises(FileNotFoundError, match="metadata"):
+            FAISSVectorStore(embedding_dimension=DIM).load(str(tmp_path))
+
+    def test_load_with_corrupt_metadata_raises(self, tmp_path):
+        store = _store(3)
+        store.save(str(tmp_path))
+        (tmp_path / "metadata.pkl").write_bytes(b"not a pickle at all")
+
+        from src.vector_store import FAISSVectorStore
+        with pytest.raises(ValueError, match="corrupt"):
+            FAISSVectorStore(embedding_dimension=DIM).load(str(tmp_path))
+
+    def test_load_with_mismatched_dimension_raises(self, tmp_path):
+        import pickle
+        store = _store(3)
+        store.save(str(tmp_path))
+
+        meta = pickle.loads((tmp_path / "metadata.pkl").read_bytes())
+        meta["embedding_dimension"] = DIM + 8
+        (tmp_path / "metadata.pkl").write_bytes(pickle.dumps(meta))
+
+        from src.vector_store import FAISSVectorStore
+        with pytest.raises(ValueError, match="different builds"):
+            FAISSVectorStore(embedding_dimension=DIM).load(str(tmp_path))
+
+    def test_failed_load_leaves_the_previous_index_intact(self, tmp_path):
+        """A bad reload must not blank out a store that was already serving."""
+        import pickle
+        store = _store(3)
+        store.save(str(tmp_path))
+
+        meta = pickle.loads((tmp_path / "metadata.pkl").read_bytes())
+        del meta["id_to_doc"]
+        (tmp_path / "metadata.pkl").write_bytes(pickle.dumps(meta))
+
+        with pytest.raises(ValueError, match="missing id_to_doc"):
+            store.load(str(tmp_path))
+        assert store.get_stats()["total_documents"] == 3
+        assert len(store.id_to_doc) == 3
+
+    def test_adding_after_load_does_not_collide_with_existing_ids(self, tmp_path):
+        import numpy as np
+        store = _store(3)
+        store.save(str(tmp_path))
+
+        from src.vector_store import FAISSVectorStore
+        reloaded = FAISSVectorStore(embedding_dimension=DIM)
+        reloaded.load(str(tmp_path))
+        reloaded.add_documents([{"id": "new", "embedding": np.ones(DIM, "float32")}])
+
+        assert reloaded.get_stats()["total_documents"] == 4
+        assert reloaded.search(np.ones(DIM, dtype="float32"), top_k=1)[0][0]["id"] == "new"
 
 
 # ── EMBEDDINGS ────────────────────────────────────────────────────────────────
