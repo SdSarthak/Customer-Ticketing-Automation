@@ -3,7 +3,9 @@ Translator Module
 Language detection and translation using deep-translator (no API key needed)
 """
 
-from typing import Optional
+import os
+import threading
+from typing import Callable, List, Optional
 
 try:
     from langdetect import detect_langs, DetectorFactory, LangDetectException
@@ -59,6 +61,116 @@ LANGUAGE_NAMES = {
 # unambiguous even in a handful of characters.
 MIN_LATIN_CHARS = 20
 MIN_CONFIDENCE = 0.90
+
+
+def _positive_float(name: str, default: float) -> float:
+    """Read a positive float from the environment, ignoring junk values."""
+    try:
+        value = float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# deep_translator calls requests.get() with no timeout, so an unreachable or
+# slow Google endpoint blocks the calling thread forever. Every translation is
+# therefore run on a daemon thread with a deadline: the request degrades to
+# untranslated text instead of pinning a FastAPI worker until the socket dies.
+TRANSLATION_TIMEOUT = _positive_float("TRANSLATION_TIMEOUT", 8.0)
+
+# GoogleTranslator raises NotValidLength above 5000 characters, which used to
+# mean a long ticket was silently never translated at all. Long text is split
+# and reassembled instead.
+MAX_CHARS_PER_REQUEST = 4500
+
+
+class TranslationTimeout(RuntimeError):
+    """Raised internally when a translation call outlives TRANSLATION_TIMEOUT."""
+
+
+def _call_with_timeout(fn: Callable[[], str], timeout: float) -> str:
+    """
+    Run `fn` on a daemon thread and give up after `timeout` seconds.
+
+    The worker cannot be cancelled — a blocked socket read is not interruptible
+    — but it is a daemon, so an abandoned call never delays interpreter exit.
+    """
+    box = {}
+
+    def _run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+
+    if worker.is_alive():
+        raise TranslationTimeout(f"translation did not finish within {timeout:g}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value", "")
+
+
+def _split_for_translation(text: str, limit: int = MAX_CHARS_PER_REQUEST) -> List[str]:
+    """
+    Split text into pieces no longer than `limit`, preferring paragraph, then
+    sentence, then whitespace boundaries so the translator sees whole thoughts.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = max(window.rfind("\n\n"), window.rfind("\n"))
+        if cut < limit // 2:
+            cut = max(window.rfind(". "), window.rfind("? "), window.rfind("! "))
+            cut = cut + 1 if cut != -1 else -1
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _translate(text: str, source: str, target: str) -> str:
+    """
+    Translate `text`, chunking long input and bounding the whole operation.
+
+    Returns the original text unchanged on any failure — a degraded English
+    reply beats no reply at all for a support agent.
+    """
+    if not text or not text.strip():
+        return text
+
+    chunks = _split_for_translation(text)
+    # Give the whole message the same wall-clock budget per chunk, so a long
+    # description cannot multiply the deadline without bound.
+    per_chunk = max(TRANSLATION_TIMEOUT / max(len(chunks), 1), 2.0)
+
+    try:
+        translator = GoogleTranslator(source=source, target=target)
+        pieces = [
+            _call_with_timeout(lambda c=chunk: translator.translate(c) or c, per_chunk)
+            for chunk in chunks
+        ]
+    except TranslationTimeout as e:
+        print(f"⚠️ Translation {source}->{target} timed out: {e}")
+        return text
+    except Exception as e:
+        print(f"⚠️ Translation {source}->{target} failed: {e}")
+        return text
+
+    return "".join(pieces)
 
 
 def _has_non_latin(text: str) -> bool:
@@ -121,19 +233,14 @@ def translate_to_english(text: str, src_lang: Optional[str] = None) -> str:
     Returns:
         English translation, or original text if translation fails.
     """
-    if not DEEP_TRANSLATOR_AVAILABLE:
+    if not DEEP_TRANSLATOR_AVAILABLE or not text:
         return text
 
     src_lang = src_lang or detect_language(text)
     if src_lang == "en":
         return text
 
-    try:
-        translator = GoogleTranslator(source=src_lang, target="en")
-        return translator.translate(text) or text
-    except Exception as e:
-        print(f"⚠️ Translation to English failed: {e}")
-        return text
+    return _translate(text, source=src_lang, target="en")
 
 
 def translate_from_english(text: str, target_lang: str) -> str:
@@ -147,15 +254,10 @@ def translate_from_english(text: str, target_lang: str) -> str:
     Returns:
         Translated text, or original if target is English or translation fails.
     """
-    if not DEEP_TRANSLATOR_AVAILABLE or target_lang == "en" or not target_lang:
+    if not DEEP_TRANSLATOR_AVAILABLE or target_lang == "en" or not target_lang or not text:
         return text
 
-    try:
-        translator = GoogleTranslator(source="en", target=target_lang)
-        return translator.translate(text) or text
-    except Exception as e:
-        print(f"⚠️ Translation to {target_lang} failed: {e}")
-        return text
+    return _translate(text, source="en", target=target_lang)
 
 
 def get_language_name(lang_code: str) -> str:

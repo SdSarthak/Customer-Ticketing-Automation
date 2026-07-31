@@ -917,3 +917,98 @@ class TestTranslator:
     def test_unknown_language_name_falls_back_to_code(self):
         from src.translator import get_language_name
         assert get_language_name("xx") == "XX"
+
+    # ── timeouts and long input ───────────────────────────────────────────────
+
+    def test_hanging_translation_does_not_block_forever(self):
+        """deep_translator has no request timeout; the wrapper must impose one."""
+        import time
+        import src.translator as translator
+
+        def _hang(*_a, **_k):
+            time.sleep(30)
+            return "never"
+
+        fake = MagicMock()
+        fake.translate.side_effect = _hang
+
+        started = time.monotonic()
+        with patch.object(translator, "GoogleTranslator", return_value=fake), \
+             patch.object(translator, "TRANSLATION_TIMEOUT", 0.2):
+            out = translator.translate_from_english("hello there", "fr")
+        elapsed = time.monotonic() - started
+
+        assert out == "hello there"      # degrades to the original, not a hang
+        assert elapsed < 5               # and returns promptly
+
+    def test_long_text_is_chunked_under_the_api_limit(self):
+        """>5000 chars used to raise NotValidLength and never get translated."""
+        import src.translator as translator
+
+        long_text = ("Sentence number one. " * 600).strip()  # ~12k chars
+        assert len(long_text) > 5000
+
+        seen = []
+
+        def _translate(chunk):
+            seen.append(chunk)
+            return chunk.upper()
+
+        fake = MagicMock()
+        fake.translate.side_effect = _translate
+
+        with patch.object(translator, "GoogleTranslator", return_value=fake):
+            out = translator.translate_from_english(long_text, "fr")
+
+        assert len(seen) > 1
+        assert all(len(c) <= translator.MAX_CHARS_PER_REQUEST for c in seen)
+        assert "".join(seen) == long_text          # nothing dropped or duplicated
+        assert out == long_text.upper()
+
+    def test_short_text_is_sent_as_a_single_call(self):
+        import src.translator as translator
+        fake = MagicMock()
+        fake.translate.return_value = "bonjour"
+        with patch.object(translator, "GoogleTranslator", return_value=fake):
+            assert translator.translate_from_english("hello", "fr") == "bonjour"
+        assert fake.translate.call_count == 1
+
+    def test_split_is_lossless_and_prefers_boundaries(self):
+        from src.translator import _split_for_translation
+
+        text = "\n".join(f"Line {i} with some filler words." for i in range(500))
+        chunks = _split_for_translation(text, limit=200)
+        assert len(chunks) > 1
+        assert all(len(c) <= 200 for c in chunks)
+        assert "".join(chunks) == text
+
+    def test_split_handles_text_with_no_boundaries(self):
+        from src.translator import _split_for_translation
+        text = "x" * 1000
+        chunks = _split_for_translation(text, limit=300)
+        assert "".join(chunks) == text
+        assert all(len(c) <= 300 for c in chunks)
+
+    def test_blank_text_never_hits_the_network(self):
+        import src.translator as translator
+        fake = MagicMock()
+        with patch.object(translator, "GoogleTranslator", return_value=fake):
+            assert translator.translate_from_english("   ", "fr") == "   "
+            assert translator.translate_to_english("", "fr") == ""
+        fake.translate.assert_not_called()
+
+    def test_translator_error_inside_worker_returns_original(self):
+        import src.translator as translator
+        fake = MagicMock()
+        fake.translate.side_effect = ValueError("bad payload")
+        with patch.object(translator, "GoogleTranslator", return_value=fake):
+            assert translator.translate_to_english("hola amigo", "es") == "hola amigo"
+
+    def test_timeout_env_override_ignores_junk(self):
+        from src.translator import _positive_float
+        with patch.dict(os.environ, {"T_TEST": "not-a-number"}):
+            assert _positive_float("T_TEST", 8.0) == 8.0
+        with patch.dict(os.environ, {"T_TEST": "-3"}):
+            assert _positive_float("T_TEST", 8.0) == 8.0
+        with patch.dict(os.environ, {"T_TEST": "2.5"}):
+            assert _positive_float("T_TEST", 8.0) == 2.5
